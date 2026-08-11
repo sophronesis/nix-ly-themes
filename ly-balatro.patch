@@ -1,0 +1,253 @@
+diff -ruN a/src/animations/Balatro.zig b/src/animations/Balatro.zig
+--- a/src/animations/Balatro.zig	1970-01-01 01:00:00.000000000 +0100
++++ b/src/animations/Balatro.zig	2026-08-11 09:56:51.919514137 +0200
+@@ -0,0 +1,203 @@
++const std = @import("std");
++const Allocator = std.mem.Allocator;
++const Animation = @import("../tui/Animation.zig");
++const Cell = @import("../tui/Cell.zig");
++const TerminalBuffer = @import("../tui/TerminalBuffer.zig");
++const interop = @import("../interop.zig");
++
++const Balatro = @This();
++
++const math = std.math;
++const Vec2 = @Vector(2, f32);
++
++// CPU port of the Balatro paint swirl by localthunk (https://www.playbalatro.com),
++// shadertoy XXtBRr. Terminal cells act as pixels; a cell counts as 1 unit wide
++// and 2 units tall so the swirl stays round. Colors follow the shader exactly
++// (including the gloss highlights), quantized to a ladder of pre-dithered cells.
++const spin_rotation: f32 = -2.0;
++const spin_speed: f32 = 7.0;
++const contrast: f32 = 3.5;
++const lighting: f32 = 0.4;
++const spin_amount: f32 = 0.25;
++const pixel_filter: f32 = 745.0;
++const spin_ease: f32 = 1.0;
++const contrast_mod: f32 = 0.25 * contrast + 0.5 * spin_amount + 1.2;
++
++// paint_res in [0,2] quantized into this many pre-dithered cells
++const palette_len: usize = 48;
++const index_scale: f32 = @as(f32, @floatFromInt(palette_len)) / 2.0;
++// the full field recompute runs at most this often (wall clock, so the swirl
++// speed matches the shader regardless of min_refresh_delta); in-between frames
++// just replay the cached cells
++const compute_interval_us: i64 = 33_000;
++
++allocator: Allocator,
++terminal_buffer: *TerminalBuffer,
++cells: []u8,
++palette: [palette_len]Cell,
++start_us: i64,
++next_compute_us: i64,
++
++fn length(vec: Vec2) f32 {
++    return math.sqrt(vec[0] * vec[0] + vec[1] * vec[1]);
++}
++
++fn nowMicros() ?i64 {
++    const tod = interop.getTimeOfDay() catch return null;
++    return tod.seconds * 1_000_000 + tod.microseconds;
++}
++
++fn rgb(color: u32) [3]f32 {
++    return .{
++        @as(f32, @floatFromInt((color >> 16) & 0xFF)) / 255.0,
++        @as(f32, @floatFromInt((color >> 8) & 0xFF)) / 255.0,
++        @as(f32, @floatFromInt(color & 0xFF)) / 255.0,
++    };
++}
++
++// The shader's final color is a pure function of paint_res, so the whole
++// gradient (three-color mix plus gloss light) collapses into a small LUT.
++// Each entry becomes the shaded-glyph cell whose fg/bg blend sits closest
++// to the exact shader color; white is offered as a fg so the gloss streaks
++// at the paint centers survive quantization.
++fn buildPalette(col1: u32, col2: u32, col3: u32) [palette_len]Cell {
++    const shades = [_]struct { ch: u32, coverage: f32 }{
++        .{ .ch = 0x2591, .coverage = 0.25 },
++        .{ .ch = 0x2592, .coverage = 0.5 },
++        .{ .ch = 0x2593, .coverage = 0.75 },
++        .{ .ch = 0x2588, .coverage = 1.0 },
++    };
++    const white: u32 = 0x00FFFFFF;
++    const fg_colors = [_]u32{ col1, col2, col3, white };
++    const bg_colors = [_]u32{ col1, col2, col3 };
++    const rgb1 = rgb(col1);
++    const rgb2 = rgb(col2);
++    const rgb3 = rgb(col3);
++    const weights = [3]f32{ 0.3, 0.59, 0.11 };
++
++    var palette: [palette_len]Cell = undefined;
++    for (&palette, 0..) |*cell, i| {
++        const paint_res = (@as(f32, @floatFromInt(i)) + 0.5) / index_scale;
++        const c1p = @max(0.0, 1.0 - contrast_mod * @abs(1.0 - paint_res));
++        const c2p = @max(0.0, 1.0 - contrast_mod * @abs(paint_res));
++        const c3p = 1.0 - @min(1.0, c1p + c2p);
++        const light = (lighting - 0.2) * @max(c1p * 5.0 - 4.0, 0.0) + lighting * @max(c2p * 5.0 - 4.0, 0.0);
++        const base = 0.3 / contrast;
++
++        var target: [3]f32 = undefined;
++        for (0..3) |c| {
++            const mixed = rgb1[c] * c1p + rgb2[c] * c2p + rgb3[c] * c3p;
++            target[c] = math.clamp(base * rgb1[c] + (1.0 - base) * mixed + light, 0.0, 1.0);
++        }
++
++        var best_dist = math.floatMax(f32);
++        for (fg_colors) |fg| {
++            const fg_rgb = rgb(fg);
++            for (bg_colors) |bg| {
++                const bg_rgb = rgb(bg);
++                for (shades) |shade| {
++                    var dist: f32 = 0.0;
++                    for (0..3) |c| {
++                        const blended = fg_rgb[c] * shade.coverage + bg_rgb[c] * (1.0 - shade.coverage);
++                        const delta = blended - target[c];
++                        dist += weights[c] * delta * delta;
++                    }
++                    if (dist < best_dist) {
++                        best_dist = dist;
++                        cell.* = Cell.init(shade.ch, fg, bg);
++                    }
++                }
++            }
++        }
++    }
++    return palette;
++}
++
++pub fn init(allocator: Allocator, terminal_buffer: *TerminalBuffer, col1: u32, col2: u32, col3: u32) !Balatro {
++    const cells = try allocator.alloc(u8, terminal_buffer.width * terminal_buffer.height);
++    @memset(cells, 0);
++
++    return .{
++        .allocator = allocator,
++        .terminal_buffer = terminal_buffer,
++        .cells = cells,
++        .palette = buildPalette(col1, col2, col3),
++        .start_us = nowMicros() orelse 0,
++        .next_compute_us = math.minInt(i64),
++    };
++}
++
++pub fn animation(self: *Balatro) Animation {
++    return Animation.init(self, deinit, realloc, draw);
++}
++
++fn deinit(self: *Balatro) void {
++    self.allocator.free(self.cells);
++}
++
++fn realloc(self: *Balatro) anyerror!void {
++    self.cells = try self.allocator.realloc(self.cells, self.terminal_buffer.width * self.terminal_buffer.height);
++    @memset(self.cells, 0);
++    self.next_compute_us = math.minInt(i64);
++}
++
++fn draw(self: *Balatro) void {
++    const width = self.terminal_buffer.width;
++    const height = self.terminal_buffer.height;
++    // never index a cache that doesn't match the current dimensions
++    if (self.cells.len != width * height) realloc(self) catch return;
++
++    const now = nowMicros() orelse self.start_us;
++    if (now < self.next_compute_us) {
++        for (0..height) |y| {
++            for (0..width) |x| self.palette[self.cells[y * width + x]].put(x, y);
++        }
++        return;
++    }
++    self.next_compute_us = now + compute_interval_us;
++
++    const time = @as(f32, @floatFromInt(now - self.start_us)) / 1_000_000.0;
++    const speed = time * spin_speed;
++    const rotation = spin_rotation * spin_ease * 0.2 + 302.2;
++
++    const w: f32 = @floatFromInt(width);
++    const h: f32 = @floatFromInt(height * 2);
++    const screen_len = math.sqrt(w * w + h * h);
++    const pixel_size = screen_len / pixel_filter;
++
++    for (0..width) |x| {
++        for (0..height) |y| {
++            const px = @as(f32, @floatFromInt(x)) + 0.5;
++            const py = @as(f32, @floatFromInt(y)) * 2.0 + 1.0;
++
++            var uv = Vec2{
++                (math.floor(px / pixel_size) * pixel_size - 0.5 * w) / screen_len,
++                (math.floor(py / pixel_size) * pixel_size - 0.5 * h) / screen_len,
++            };
++            const uv_len = length(uv);
++
++            const angle = math.atan2(uv[1], uv[0]) + rotation -
++                spin_ease * 20.0 * (spin_amount * uv_len + (1.0 - spin_amount));
++            // the shader offsets this by `mid` and immediately subtracts it back
++            uv = .{ uv_len * math.cos(angle), uv_len * math.sin(angle) };
++
++            uv *= @as(Vec2, @splat(30.0));
++            var uv2 = Vec2{ uv[0] + uv[1], uv[0] + uv[1] };
++
++            for (0..5) |_| {
++                uv2 += @as(Vec2, @splat(math.sin(@max(uv[0], uv[1])))) + uv;
++                uv += @as(Vec2, @splat(0.5)) * Vec2{
++                    math.cos(5.1123314 + 0.353 * uv2[1] + speed * 0.131121),
++                    math.sin(uv2[0] - 0.113 * speed),
++                };
++                uv -= @as(Vec2, @splat(math.cos(uv[0] + uv[1]) - math.sin(uv[0] * 0.711 - uv[1])));
++            }
++
++            const paint_res = @min(2.0, @max(0.0, length(uv) * 0.035 * contrast_mod));
++            const index: usize = @min(palette_len - 1, @as(usize, @intFromFloat(paint_res * index_scale)));
++
++            self.cells[y * width + x] = @intCast(index);
++            self.palette[index].put(x, y);
++        }
++    }
++}
+diff -ruN a/src/config/Config.zig b/src/config/Config.zig
+--- a/src/config/Config.zig	2026-08-11 09:56:14.765565622 +0200
++++ b/src/config/Config.zig	2026-08-11 10:07:45.745819527 +0200
+@@ -15,6 +15,9 @@
+ auto_login_service: [:0]const u8 = "ly-autologin",
+ auto_login_session: ?[]const u8 = null,
+ auto_login_user: ?[]const u8 = null,
++balatro_col1: u32 = 0x00DE443B,
++balatro_col2: u32 = 0x000055B4,
++balatro_col3: u32 = 0x20000000,
+ bg: u32 = 0x00000000,
+ bigclock: Bigclock = .none,
+ bigclock_12hr: bool = false,
+diff -ruN a/src/enums.zig b/src/enums.zig
+--- a/src/enums.zig	2026-08-11 09:56:14.765692791 +0200
++++ b/src/enums.zig	2026-08-11 09:57:12.678022527 +0200
+@@ -6,6 +6,7 @@
+     colormix,
+     gameoflife,
+     dur_file,
++    balatro,
+ };
+ 
+ pub const DisplayServer = enum {
+diff -ruN a/src/main.zig b/src/main.zig
+--- a/src/main.zig	2026-08-11 09:56:14.765768904 +0200
++++ b/src/main.zig	2026-08-11 09:57:12.678521635 +0200
+@@ -8,6 +8,7 @@
+ const enums = @import("enums.zig");
+ const Environment = @import("Environment.zig");
+ const interop = @import("interop.zig");
++const Balatro = @import("animations/Balatro.zig");
+ const ColorMix = @import("animations/ColorMix.zig");
+ const Doom = @import("animations/Doom.zig");
+ const Dummy = @import("animations/Dummy.zig");
+@@ -574,6 +575,10 @@
+             var color_mix = ColorMix.init(&buffer, config.colormix_col1, config.colormix_col2, config.colormix_col3);
+             animation = color_mix.animation();
+         },
++        .balatro => {
++            var balatro = try Balatro.init(allocator, &buffer, config.balatro_col1, config.balatro_col2, config.balatro_col3);
++            animation = balatro.animation();
++        },
+         .gameoflife => {
+             var game_of_life = try GameOfLife.init(allocator, &buffer, config.gameoflife_fg, config.gameoflife_entropy_interval, config.gameoflife_frame_delay, config.gameoflife_initial_density);
+             animation = game_of_life.animation();
