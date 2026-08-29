@@ -1,13 +1,42 @@
+diff -ruN a/res/config.ini b/res/config.ini
+--- a/res/config.ini	2026-08-13 23:02:47.841898769 +0200
++++ b/res/config.ini	2026-08-13 23:03:56.782346130 +0200
+@@ -25,6 +25,7 @@
+ # colormix -> Color mixing shader
+ # gameoflife -> John Conway's Game of Life
+ # dur_file -> .dur file format (https://github.com/cmang/durdraw/tree/master)
++# balatro  -> Balatro paint swirl (shadertoy XXtBRr by localthunk)
+ animation = none
+ 
+ # Delay between each animation frame in milliseconds
+@@ -134,6 +135,12 @@
+ # For Japanese characters for example, you can use 0x30FF here
+ cmatrix_max_codepoint = 0x7B
+ 
++# Balatro animation: swirl colors, 0xRRGGBB.
++# col1/col2 are the two paint colors, col3 the dark backing.
++balatro_col1 = 0x00DE443B
++balatro_col2 = 0x000055B4
++balatro_col3 = 0x20000000
++
+ # Color mixing animation first color id
+ colormix_col1 = 0x00FF0000
+ 
 diff -ruN a/src/animations/Balatro.zig b/src/animations/Balatro.zig
 --- a/src/animations/Balatro.zig	1970-01-01 01:00:00.000000000 +0100
-+++ b/src/animations/Balatro.zig	2026-08-11 09:56:51.919514137 +0200
-@@ -0,0 +1,203 @@
++++ b/src/animations/Balatro.zig	2026-08-13 23:03:23.329026184 +0200
+@@ -0,0 +1,253 @@
 +const std = @import("std");
 +const Allocator = std.mem.Allocator;
-+const Animation = @import("../tui/Animation.zig");
-+const Cell = @import("../tui/Cell.zig");
-+const TerminalBuffer = @import("../tui/TerminalBuffer.zig");
-+const interop = @import("../interop.zig");
++
++const ly_ui = @import("ly-ui");
++const Cell = ly_ui.Cell;
++const TerminalBuffer = ly_ui.TerminalBuffer;
++const Widget = ly_ui.Widget;
++
++const ly_core = ly_ui.ly_core;
++const interop = ly_core.interop;
++const TimeOfDay = interop.TimeOfDay;
 +
 +const Balatro = @This();
 +
@@ -31,16 +60,21 @@ diff -ruN a/src/animations/Balatro.zig b/src/animations/Balatro.zig
 +const palette_len: usize = 48;
 +const index_scale: f32 = @as(f32, @floatFromInt(palette_len)) / 2.0;
 +// the full field recompute runs at most this often (wall clock, so the swirl
-+// speed matches the shader regardless of min_refresh_delta); in-between frames
++// speed matches the shader regardless of the widget timeout); in-between frames
 +// just replay the cached cells
 +const compute_interval_us: i64 = 33_000;
 +
++instance: ?Widget = null,
++start_time: TimeOfDay,
 +allocator: Allocator,
 +terminal_buffer: *TerminalBuffer,
 +cells: []u8,
 +palette: [palette_len]Cell,
 +start_us: i64,
 +next_compute_us: i64,
++animate: *bool,
++timeout_sec: u12,
++frame_delay: u16,
 +
 +fn length(vec: Vec2) f32 {
 +    return math.sqrt(vec[0] * vec[0] + vec[1] * vec[1]);
@@ -117,35 +151,63 @@ diff -ruN a/src/animations/Balatro.zig b/src/animations/Balatro.zig
 +    return palette;
 +}
 +
-+pub fn init(allocator: Allocator, terminal_buffer: *TerminalBuffer, col1: u32, col2: u32, col3: u32) !Balatro {
++pub fn init(
++    allocator: Allocator,
++    terminal_buffer: *TerminalBuffer,
++    col1: u32,
++    col2: u32,
++    col3: u32,
++    animate: *bool,
++    timeout_sec: u12,
++    frame_delay: u16,
++) !Balatro {
 +    const cells = try allocator.alloc(u8, terminal_buffer.width * terminal_buffer.height);
 +    @memset(cells, 0);
 +
 +    return .{
++        .instance = null,
++        .start_time = try interop.getTimeOfDay(),
 +        .allocator = allocator,
 +        .terminal_buffer = terminal_buffer,
 +        .cells = cells,
 +        .palette = buildPalette(col1, col2, col3),
 +        .start_us = nowMicros() orelse 0,
 +        .next_compute_us = math.minInt(i64),
++        .animate = animate,
++        .timeout_sec = timeout_sec,
++        .frame_delay = frame_delay,
 +    };
 +}
 +
-+pub fn animation(self: *Balatro) Animation {
-+    return Animation.init(self, deinit, realloc, draw);
++pub fn widget(self: *Balatro) *Widget {
++    if (self.instance) |*instance| return instance;
++    self.instance = Widget.init(
++        "Balatro",
++        null,
++        self,
++        deinit,
++        realloc,
++        draw,
++        update,
++        null,
++        calculateTimeout,
++    );
++    return &self.instance.?;
 +}
 +
 +fn deinit(self: *Balatro) void {
 +    self.allocator.free(self.cells);
 +}
 +
-+fn realloc(self: *Balatro) anyerror!void {
++fn realloc(self: *Balatro) !void {
 +    self.cells = try self.allocator.realloc(self.cells, self.terminal_buffer.width * self.terminal_buffer.height);
 +    @memset(self.cells, 0);
 +    self.next_compute_us = math.minInt(i64);
 +}
 +
 +fn draw(self: *Balatro) void {
++    if (!self.animate.*) return;
++
 +    const width = self.terminal_buffer.width;
 +    const height = self.terminal_buffer.height;
 +    // never index a cache that doesn't match the current dimensions
@@ -205,10 +267,22 @@ diff -ruN a/src/animations/Balatro.zig b/src/animations/Balatro.zig
 +        }
 +    }
 +}
++
++fn update(self: *Balatro, _: *anyopaque) !void {
++    const time = try interop.getTimeOfDay();
++
++    if (self.timeout_sec > 0 and time.seconds - self.start_time.seconds > self.timeout_sec) {
++        self.animate.* = false;
++    }
++}
++
++fn calculateTimeout(self: *Balatro, _: *anyopaque) !?usize {
++    return self.frame_delay;
++}
 diff -ruN a/src/config/Config.zig b/src/config/Config.zig
---- a/src/config/Config.zig	2026-08-11 09:56:14.765565622 +0200
-+++ b/src/config/Config.zig	2026-08-11 10:07:45.745819527 +0200
-@@ -15,6 +15,9 @@
+--- a/src/config/Config.zig	2026-08-13 23:02:47.844173830 +0200
++++ b/src/config/Config.zig	2026-08-13 23:03:41.564525217 +0200
+@@ -17,6 +17,9 @@
  auto_login_service: [:0]const u8 = "ly-autologin",
  auto_login_session: ?[]const u8 = null,
  auto_login_user: ?[]const u8 = null,
@@ -219,9 +293,9 @@ diff -ruN a/src/config/Config.zig b/src/config/Config.zig
  bigclock: Bigclock = .none,
  bigclock_12hr: bool = false,
 diff -ruN a/src/enums.zig b/src/enums.zig
---- a/src/enums.zig	2026-08-11 09:56:14.765692791 +0200
-+++ b/src/enums.zig	2026-08-11 09:57:12.678022527 +0200
-@@ -6,6 +6,7 @@
+--- a/src/enums.zig	2026-08-13 23:02:47.844351373 +0200
++++ b/src/enums.zig	2026-08-13 23:03:41.564461307 +0200
+@@ -7,6 +7,7 @@
      colormix,
      gameoflife,
      dur_file,
@@ -230,24 +304,33 @@ diff -ruN a/src/enums.zig b/src/enums.zig
  
  pub const DisplayServer = enum {
 diff -ruN a/src/main.zig b/src/main.zig
---- a/src/main.zig	2026-08-11 09:56:14.765768904 +0200
-+++ b/src/main.zig	2026-08-11 09:57:12.678521635 +0200
-@@ -8,6 +8,7 @@
- const enums = @import("enums.zig");
- const Environment = @import("Environment.zig");
- const interop = @import("interop.zig");
+--- a/src/main.zig	2026-08-13 23:02:47.844412648 +0200
++++ b/src/main.zig	2026-08-13 23:03:41.564985749 +0200
+@@ -23,6 +23,7 @@
+ const ini = ly_core.ini;
+ const Ini = ini.Ini;
+ 
 +const Balatro = @import("animations/Balatro.zig");
+ const Cascade = @import("animations/Cascade.zig");
  const ColorMix = @import("animations/ColorMix.zig");
  const Doom = @import("animations/Doom.zig");
- const Dummy = @import("animations/Dummy.zig");
-@@ -574,6 +575,10 @@
-             var color_mix = ColorMix.init(&buffer, config.colormix_col1, config.colormix_col2, config.colormix_col3);
-             animation = color_mix.animation();
+@@ -1077,6 +1078,19 @@
+             );
+             animation = dur.widget();
          },
 +        .balatro => {
-+            var balatro = try Balatro.init(allocator, &buffer, config.balatro_col1, config.balatro_col2, config.balatro_col3);
-+            animation = balatro.animation();
++            var balatro = try Balatro.init(
++                state.allocator,
++                &state.buffer,
++                state.config.balatro_col1,
++                state.config.balatro_col2,
++                state.config.balatro_col3,
++                &state.animate,
++                state.config.animation_timeout_sec,
++                state.config.animation_frame_delay,
++            );
++            animation = balatro.widget();
 +        },
-         .gameoflife => {
-             var game_of_life = try GameOfLife.init(allocator, &buffer, config.gameoflife_fg, config.gameoflife_entropy_interval, config.gameoflife_frame_delay, config.gameoflife_initial_density);
-             animation = game_of_life.animation();
+     }
+     defer if (animation) |a| a.deinit();
+ 

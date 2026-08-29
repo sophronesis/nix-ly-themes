@@ -1,0 +1,1384 @@
+diff -ruN ly-base/res/config.ini ly-work/res/config.ini
+--- ly-base/res/config.ini	2026-08-29 23:50:01.112202688 +0200
++++ ly-work/res/config.ini	2026-08-30 00:12:37.325083572 +0200
+@@ -26,6 +26,7 @@
+ # gameoflife -> John Conway's Game of Life
+ # dur_file -> .dur file format (https://github.com/cmang/durdraw/tree/master)
+ # balatro  -> Balatro paint swirl (shadertoy XXtBRr by localthunk)
++# shader   -> Arbitrary shadertoy-format fragment shader (see shader_path)
+ animation = none
+ 
+ # Delay between each animation frame in milliseconds
+@@ -141,6 +142,44 @@
+ balatro_col2 = 0x000055B4
+ balatro_col3 = 0x20000000
+ 
++# Shader animation: path to a fragment shader in shadertoy "Image" format
++# (defines mainImage(out vec4, in vec2); iTime/iResolution/iFrame/iDate etc.
++# are provided, iChannel0-3 sample black). Rendered offscreen through EGL
++# (GPU when a render node is usable, llvmpipe otherwise) and quantized to
++# terminal cells. Requires full_color = true. Any failure (missing file, no
++# EGL stack, GLSL error) is logged to ly_log and the balatro animation runs
++# as fallback instead.
++#shader_path = /etc/ly/shader.frag
++
++# EGL dispatch library for the shader animation. Must export the public EGL
++# API (glvnd's libEGL.so.1 or a full non-glvnd libEGL); vendor ICDs like
++# libEGL_mesa.so.0 won't work. Unset means: try /run/opengl-driver, then the
++# usual sonames. On NixOS point this into a libglvnd store path.
++#shader_egl_lib = /usr/lib/libEGL.so.1
++
++# Render the shader on the CPU (mesa's llvmpipe software device) and never
++# open a GPU. Full GLSL still works; costs some CPU per frame at the greeter.
++shader_software = false
++
++# DRM device the shader should render on, matched against the EGL device
++# list (by-path symlinks are fine). Useful on hybrid-GPU laptops to keep the
++# login screen off the dGPU. Ignored when shader_software is on. Unset =
++# mesa's default pick (first usable render node).
++#shader_drm_device = /dev/dri/renderD128
++
++# How the shader image maps to cells:
++# shade16     -> one color per cell out of the 16 VT colors, approximated
++#                with dithering + shade glyphs (best bet on the console)
++# halfblock   -> two truecolor pixels per cell via upper-half-blocks (best
++#                in graphical terminals; the VT quantizes it to 16 colors)
++# halfblock16 -> half-blocks, but pre-quantized+dithered to the VT palette
++shader_cell_mode = shade16
++
++# Shader frame rate cap (1-60) and supersampling factor (1-4; the shader
++# renders at cell_width*S x cell_height*2*S pixels and is box-filtered down)
++shader_fps = 30
++shader_supersample = 2
++
+ # Color mixing animation first color id
+ colormix_col1 = 0x00FF0000
+ 
+diff -ruN ly-base/src/animations/ShaderGl.zig ly-work/src/animations/ShaderGl.zig
+--- ly-base/src/animations/ShaderGl.zig	1970-01-01 01:00:00.000000000 +0100
++++ ly-work/src/animations/ShaderGl.zig	2026-08-30 00:37:22.631440037 +0200
+@@ -0,0 +1,684 @@
++const std = @import("std");
++
++// Minimal EGL + OpenGL ES 3.0 offscreen rendering context, loaded entirely at
++// runtime via dlopen/dlsym so ly gains no build- or link-time dependency on
++// mesa. If no usable EGL stack exists on the machine, init() fails and the
++// caller falls back to a blank background. GL entry points are resolved through
++// eglGetProcAddress (EGL 1.5 semantics, which mesa implements), with a dlopen
++// of libGLESv2 as a fallback for pedantic implementations.
++
++extern "c" fn dlopen(path: [*:0]const u8, mode: c_int) ?*anyopaque;
++extern "c" fn dlsym(handle: ?*anyopaque, symbol: [*:0]const u8) ?*anyopaque;
++extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
++extern "c" fn access(path: [*:0]const u8, mode: c_int) c_int;
++extern "c" fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
++
++const RTLD_NOW: c_int = 2;
++
++// Only the glvnd dispatch library (or a full non-glvnd mesa libEGL) exports
++// the public EGL API; vendor ICDs like libEGL_mesa.so.0 export nothing but
++// __egl_Main, so candidates are only accepted if eglGetProcAddress resolves.
++// NixOS has no dlopen search path for GL and doesn't ship the dispatch
++// library in /run/opengl-driver, so the practical way in is shader_egl_lib
++// pointing into a libglvnd store path. Bare sonames cover FHS distributions.
++const egl_candidates = [_][*:0]const u8{
++    "/run/opengl-driver/lib/libEGL.so.1",
++    "libEGL.so.1",
++    "libEGL.so",
++};
++
++// glvnd's compiled-in vendor search paths don't exist on NixOS; the mesa
++// ICD json lives here instead. Only exported when unset and actually present
++// so FHS systems and user overrides are left alone.
++const nixos_vendor_dir = "/run/opengl-driver/share/glvnd/egl_vendor.d";
++
++const gles_candidates = [_][*:0]const u8{
++    "/run/opengl-driver/lib/libGLESv2.so.2",
++    "libGLESv2.so.2",
++    "libGLESv2.so",
++};
++
++const EGLDisplay = ?*anyopaque;
++const EGLConfig = ?*anyopaque;
++const EGLContext = ?*anyopaque;
++const EGLSurface = ?*anyopaque;
++const EGLBoolean = c_uint;
++const EGLenum = c_uint;
++const EGLint = i32;
++
++const EGL_TRUE: EGLBoolean = 1;
++const EGL_NONE: EGLint = 0x3038;
++const EGL_ALPHA_SIZE: EGLint = 0x3021;
++const EGL_BLUE_SIZE: EGLint = 0x3022;
++const EGL_GREEN_SIZE: EGLint = 0x3023;
++const EGL_RED_SIZE: EGLint = 0x3024;
++const EGL_SURFACE_TYPE: EGLint = 0x3033;
++const EGL_PBUFFER_BIT: EGLint = 0x0001;
++const EGL_RENDERABLE_TYPE: EGLint = 0x3040;
++const EGL_OPENGL_ES3_BIT: EGLint = 0x0040;
++const EGL_HEIGHT: EGLint = 0x3056;
++const EGL_WIDTH: EGLint = 0x3057;
++const EGL_CONTEXT_CLIENT_VERSION: EGLint = 0x3098;
++const EGL_OPENGL_ES_API: EGLenum = 0x30A0;
++const EGL_PLATFORM_DEVICE_EXT: EGLenum = 0x313F;
++const EGL_PLATFORM_SURFACELESS_MESA: EGLenum = 0x31DD;
++const EGL_DRM_DEVICE_FILE_EXT: EGLint = 0x3233;
++const EGL_DRM_RENDER_NODE_FILE_EXT: EGLint = 0x3377;
++const EGL_EXTENSIONS: EGLint = 0x3055;
++
++const GLboolean = u8;
++const GLenum = u32;
++const GLuint = u32;
++const GLint = i32;
++const GLsizei = i32;
++const GLfloat = f32;
++
++const GL_TRIANGLES: GLenum = 0x0004;
++const GL_UNSIGNED_BYTE: GLenum = 0x1401;
++const GL_RGBA: GLenum = 0x1908;
++const GL_VENDOR: GLenum = 0x1F00;
++const GL_RENDERER: GLenum = 0x1F01;
++const GL_VERSION: GLenum = 0x1F02;
++const GL_TEXTURE_2D: GLenum = 0x0DE1;
++const GL_TEXTURE_MAG_FILTER: GLenum = 0x2800;
++const GL_TEXTURE_MIN_FILTER: GLenum = 0x2801;
++const GL_TEXTURE_WRAP_S: GLenum = 0x2802;
++const GL_TEXTURE_WRAP_T: GLenum = 0x2803;
++const GL_LINEAR: GLint = 0x2601;
++const GL_LINEAR_MIPMAP_LINEAR: GLint = 0x2703;
++const GL_REPEAT: GLint = 0x2901;
++const GL_TEXTURE0: GLenum = 0x84C0;
++const GL_PACK_ALIGNMENT: GLenum = 0x0D05;
++const GL_FRAGMENT_SHADER: GLenum = 0x8B30;
++const GL_VERTEX_SHADER: GLenum = 0x8B31;
++const GL_COMPILE_STATUS: GLenum = 0x8B81;
++const GL_LINK_STATUS: GLenum = 0x8B82;
++const GL_FRAMEBUFFER: GLenum = 0x8D40;
++const GL_RENDERBUFFER: GLenum = 0x8D41;
++const GL_RGBA8: GLenum = 0x8058;
++const GL_COLOR_ATTACHMENT0: GLenum = 0x8CE0;
++const GL_FRAMEBUFFER_COMPLETE: GLenum = 0x8CD5;
++
++const EglProcs = struct {
++    eglGetProcAddress: *const fn (name: [*:0]const u8) callconv(.c) ?*anyopaque,
++    eglGetDisplay: *const fn (native_display: ?*anyopaque) callconv(.c) EGLDisplay,
++    eglInitialize: *const fn (dpy: EGLDisplay, major: ?*EGLint, minor: ?*EGLint) callconv(.c) EGLBoolean,
++    eglBindAPI: *const fn (api: EGLenum) callconv(.c) EGLBoolean,
++    eglChooseConfig: *const fn (dpy: EGLDisplay, attribs: [*]const EGLint, configs: ?[*]EGLConfig, config_size: EGLint, num_config: *EGLint) callconv(.c) EGLBoolean,
++    eglCreateContext: *const fn (dpy: EGLDisplay, config: EGLConfig, share: EGLContext, attribs: [*]const EGLint) callconv(.c) EGLContext,
++    eglCreatePbufferSurface: *const fn (dpy: EGLDisplay, config: EGLConfig, attribs: [*]const EGLint) callconv(.c) EGLSurface,
++    eglMakeCurrent: *const fn (dpy: EGLDisplay, draw: EGLSurface, read: EGLSurface, ctx: EGLContext) callconv(.c) EGLBoolean,
++    eglGetError: *const fn () callconv(.c) EGLint,
++    eglDestroySurface: *const fn (dpy: EGLDisplay, surface: EGLSurface) callconv(.c) EGLBoolean,
++    eglDestroyContext: *const fn (dpy: EGLDisplay, ctx: EGLContext) callconv(.c) EGLBoolean,
++    eglTerminate: *const fn (dpy: EGLDisplay) callconv(.c) EGLBoolean,
++};
++
++const GlProcs = struct {
++    glGetString: *const fn (name: GLenum) callconv(.c) ?[*:0]const u8,
++    glGetError: *const fn () callconv(.c) GLenum,
++    glGenVertexArrays: *const fn (n: GLsizei, arrays: [*]GLuint) callconv(.c) void,
++    glBindVertexArray: *const fn (array: GLuint) callconv(.c) void,
++    glGenFramebuffers: *const fn (n: GLsizei, framebuffers: [*]GLuint) callconv(.c) void,
++    glBindFramebuffer: *const fn (target: GLenum, framebuffer: GLuint) callconv(.c) void,
++    glGenRenderbuffers: *const fn (n: GLsizei, renderbuffers: [*]GLuint) callconv(.c) void,
++    glBindRenderbuffer: *const fn (target: GLenum, renderbuffer: GLuint) callconv(.c) void,
++    glRenderbufferStorage: *const fn (target: GLenum, internalformat: GLenum, width: GLsizei, height: GLsizei) callconv(.c) void,
++    glFramebufferRenderbuffer: *const fn (target: GLenum, attachment: GLenum, renderbuffertarget: GLenum, renderbuffer: GLuint) callconv(.c) void,
++    glCheckFramebufferStatus: *const fn (target: GLenum) callconv(.c) GLenum,
++    glGenTextures: *const fn (n: GLsizei, textures: [*]GLuint) callconv(.c) void,
++    glActiveTexture: *const fn (texture: GLenum) callconv(.c) void,
++    glBindTexture: *const fn (target: GLenum, texture: GLuint) callconv(.c) void,
++    glTexImage2D: *const fn (target: GLenum, level: GLint, internalformat: GLint, width: GLsizei, height: GLsizei, border: GLint, format: GLenum, ty: GLenum, pixels: ?*const anyopaque) callconv(.c) void,
++    glTexParameteri: *const fn (target: GLenum, pname: GLenum, param: GLint) callconv(.c) void,
++    glGenerateMipmap: *const fn (target: GLenum) callconv(.c) void,
++    glCreateShader: *const fn (shader_type: GLenum) callconv(.c) GLuint,
++    glShaderSource: *const fn (shader: GLuint, count: GLsizei, strings: [*]const [*]const u8, lengths: ?[*]const GLint) callconv(.c) void,
++    glCompileShader: *const fn (shader: GLuint) callconv(.c) void,
++    glGetShaderiv: *const fn (shader: GLuint, pname: GLenum, params: *GLint) callconv(.c) void,
++    glGetShaderInfoLog: *const fn (shader: GLuint, buf_size: GLsizei, length: ?*GLsizei, info_log: [*]u8) callconv(.c) void,
++    glDeleteShader: *const fn (shader: GLuint) callconv(.c) void,
++    glCreateProgram: *const fn () callconv(.c) GLuint,
++    glAttachShader: *const fn (program: GLuint, shader: GLuint) callconv(.c) void,
++    glLinkProgram: *const fn (program: GLuint) callconv(.c) void,
++    glGetProgramiv: *const fn (program: GLuint, pname: GLenum, params: *GLint) callconv(.c) void,
++    glGetProgramInfoLog: *const fn (program: GLuint, buf_size: GLsizei, length: ?*GLsizei, info_log: [*]u8) callconv(.c) void,
++    glUseProgram: *const fn (program: GLuint) callconv(.c) void,
++    glDeleteProgram: *const fn (program: GLuint) callconv(.c) void,
++    glGetUniformLocation: *const fn (program: GLuint, name: [*:0]const u8) callconv(.c) GLint,
++    glUniform1i: *const fn (location: GLint, v0: GLint) callconv(.c) void,
++    glUniform1f: *const fn (location: GLint, v0: GLfloat) callconv(.c) void,
++    glUniform3f: *const fn (location: GLint, v0: GLfloat, v1: GLfloat, v2: GLfloat) callconv(.c) void,
++    glUniform3fv: *const fn (location: GLint, count: GLsizei, value: [*]const GLfloat) callconv(.c) void,
++    glUniform4f: *const fn (location: GLint, v0: GLfloat, v1: GLfloat, v2: GLfloat, v3: GLfloat) callconv(.c) void,
++    glViewport: *const fn (x: GLint, y: GLint, width: GLsizei, height: GLsizei) callconv(.c) void,
++    glDrawArrays: *const fn (mode: GLenum, first: GLint, count: GLsizei) callconv(.c) void,
++    glReadPixels: *const fn (x: GLint, y: GLint, width: GLsizei, height: GLsizei, format: GLenum, ty: GLenum, pixels: *anyopaque) callconv(.c) void,
++    glPixelStorei: *const fn (pname: GLenum, param: GLint) callconv(.c) void,
++};
++
++// Shadertoy compiles image shaders as GLSL ES 3.00 with these uniforms
++// implicitly declared; a shader file is pasted verbatim between the two parts.
++// The #line directive keeps compiler error messages pointing at the user's
++// own line numbers. iChannel0-3 are bound to 1x1 black textures so shaders
++// sampling them still compile and run (they just read black).
++const fragment_preamble =
++    "#version 300 es\n" ++
++    "precision highp float;\n" ++
++    "precision highp int;\n" ++
++    "precision highp sampler2D;\n" ++
++    "out vec4 ly_out_color;\n" ++
++    "uniform vec3 iResolution;\n" ++
++    "uniform float iTime;\n" ++
++    "uniform float iTimeDelta;\n" ++
++    "uniform float iFrameRate;\n" ++
++    "uniform int iFrame;\n" ++
++    "uniform vec4 iMouse;\n" ++
++    "uniform vec4 iDate;\n" ++
++    "uniform float iSampleRate;\n" ++
++    "uniform float iChannelTime[4];\n" ++
++    "uniform vec3 iChannelResolution[4];\n" ++
++    "uniform sampler2D iChannel0;\n" ++
++    "uniform sampler2D iChannel1;\n" ++
++    "uniform sampler2D iChannel2;\n" ++
++    "uniform sampler2D iChannel3;\n" ++
++    "#line 1\n";
++
++const fragment_epilogue =
++    "\nvoid main() {\n" ++
++    "    vec4 ly_color = vec4(0.0, 0.0, 0.0, 1.0);\n" ++
++    "    mainImage(ly_color, gl_FragCoord.xy);\n" ++
++    "    ly_out_color = ly_color;\n" ++
++    "}\n";
++
++const vertex_source =
++    "#version 300 es\n" ++
++    "void main() {\n" ++
++    "    vec2 pos = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n" ++
++    "    gl_Position = vec4(pos * 2.0 - 1.0, 0.0, 1.0);\n" ++
++    "}\n";
++
++pub const Error = error{
++    NoEglLibrary,
++    MissingEglSymbol,
++    MissingGlSymbol,
++    NoDisplay,
++    EglInitFailed,
++    BindApiFailed,
++    NoConfig,
++    NoContext,
++    MakeCurrentFailed,
++    FramebufferIncomplete,
++    CompileFailed,
++    LinkFailed,
++    NoProgram,
++};
++
++const Context = @This();
++
++egl: EglProcs = undefined,
++gl: GlProcs = undefined,
++egl_lib: ?*anyopaque = null,
++gles_lib: ?*anyopaque = null,
++display: EGLDisplay = null,
++context: EGLContext = null,
++surface: EGLSurface = null,
++fbo: GLuint = 0,
++rbo: GLuint = 0,
++vao: GLuint = 0,
++program: GLuint = 0,
++width: GLsizei = 0,
++height: GLsizei = 0,
++u_resolution: GLint = -1,
++u_time: GLint = -1,
++u_time_delta: GLint = -1,
++u_frame_rate: GLint = -1,
++u_frame: GLint = -1,
++u_mouse: GLint = -1,
++u_date: GLint = -1,
++u_sample_rate: GLint = -1,
++// Compile/link failure details for the caller to log
++info_log: [768]u8 = undefined,
++info_log_len: usize = 0,
++
++fn usableEglLib(path: [*:0]const u8) ?*anyopaque {
++    const handle = dlopen(path, RTLD_NOW) orelse return null;
++    if (dlsym(handle, "eglGetProcAddress") == null) return null;
++    return handle;
++}
++
++const GetPlatformDisplayFn = *const fn (platform: EGLenum, native_display: ?*anyopaque, attribs: ?[*]const EGLint) callconv(.c) EGLDisplay;
++
++fn getPlatformDisplayProc(self: *Context) ?GetPlatformDisplayFn {
++    const proc = self.egl.eglGetProcAddress("eglGetPlatformDisplayEXT") orelse return null;
++    return @ptrCast(@alignCast(proc));
++}
++
++const QueryDeviceStringFn = *const fn (device: ?*anyopaque, name: EGLint) callconv(.c) ?[*:0]const u8;
++
++fn matchesDrmNode(queryString: QueryDeviceStringFn, device: ?*anyopaque, wanted: []const u8) bool {
++    const names = [_]EGLint{ EGL_DRM_RENDER_NODE_FILE_EXT, EGL_DRM_DEVICE_FILE_EXT };
++    for (names) |name| {
++        const node = queryString(device, name) orelse continue;
++        var node_buffer: [4096]u8 = undefined;
++        const node_path = realpath(node, &node_buffer) orelse node;
++        if (std.mem.eql(u8, std.mem.span(@as([*:0]const u8, node_path)), wanted)) return true;
++    }
++    return false;
++}
++
++fn isSoftwareDevice(queryString: QueryDeviceStringFn, device: ?*anyopaque, _: []const u8) bool {
++    const extensions = queryString(device, EGL_EXTENSIONS) orelse return false;
++    return std.mem.indexOf(u8, std.mem.span(extensions), "EGL_MESA_device_software") != null;
++}
++
++// Resolves a display on the first EGL device accepted by the matcher.
++// Returns null on any failure so callers can fall through to the default
++// platform.
++fn matchingDeviceDisplay(
++    self: *Context,
++    matcher: *const fn (queryString: QueryDeviceStringFn, device: ?*anyopaque, wanted: []const u8) bool,
++    wanted: []const u8,
++) EGLDisplay {
++    const getPlatformDisplay = self.getPlatformDisplayProc() orelse return null;
++    const queryDevicesProc = self.egl.eglGetProcAddress("eglQueryDevicesEXT") orelse return null;
++    const queryDeviceStringProc = self.egl.eglGetProcAddress("eglQueryDeviceStringEXT") orelse return null;
++    const eglQueryDevicesEXT: *const fn (max_devices: EGLint, devices: [*]?*anyopaque, num_devices: *EGLint) callconv(.c) EGLBoolean = @ptrCast(@alignCast(queryDevicesProc));
++    const eglQueryDeviceStringEXT: QueryDeviceStringFn = @ptrCast(@alignCast(queryDeviceStringProc));
++
++    var devices: [16]?*anyopaque = undefined;
++    var device_count: EGLint = 0;
++    if (eglQueryDevicesEXT(devices.len, &devices, &device_count) != EGL_TRUE) return null;
++
++    for (devices[0..@intCast(@max(device_count, 0))]) |device| {
++        if (matcher(eglQueryDeviceStringEXT, device, wanted)) {
++            return getPlatformDisplay(EGL_PLATFORM_DEVICE_EXT, device, null);
++        }
++    }
++
++    return null;
++}
++
++// Display on the EGL device whose DRM (render) node matches the requested
++// path. Symlinks like /dev/dri/by-path/pci-...-render work: both sides are
++// realpath'd before comparing.
++fn deviceDisplay(self: *Context, wanted: [*:0]const u8) EGLDisplay {
++    var wanted_buffer: [4096]u8 = undefined;
++    const wanted_path = realpath(wanted, &wanted_buffer) orelse wanted;
++    return self.matchingDeviceDisplay(matchesDrmNode, std.mem.span(@as([*:0]const u8, wanted_path)));
++}
++
++pub fn init(
++    allocator_for_textures: ?std.mem.Allocator,
++    egl_lib_override: ?[*:0]const u8,
++    drm_device: ?[*:0]const u8,
++    software: bool,
++) Error!Context {
++    var self = Context{};
++
++    if (access(nixos_vendor_dir, 0) == 0) {
++        _ = setenv("__EGL_VENDOR_LIBRARY_DIRS", nixos_vendor_dir, 0);
++    }
++
++    if (egl_lib_override) |path| self.egl_lib = usableEglLib(path);
++    if (self.egl_lib == null) {
++        for (egl_candidates) |candidate| {
++            self.egl_lib = usableEglLib(candidate);
++            if (self.egl_lib != null) break;
++        }
++    }
++    if (self.egl_lib == null) return Error.NoEglLibrary;
++
++    inline for (@typeInfo(EglProcs).@"struct".fields) |field| {
++        const proc = dlsym(self.egl_lib, field.name) orelse return Error.MissingEglSymbol;
++        @field(self.egl, field.name) = @ptrCast(@alignCast(proc));
++    }
++
++    // CPU-only rendering on request: pick mesa's software device (llvmpipe)
++    // so no GPU is ever opened. Otherwise, with more than one GPU, mesa's
++    // surfaceless platform grabs the first render node it can open - on
++    // hybrid laptops that may needlessly wake the dGPU, so an explicit
++    // device wish is matched against the EGL device list. Any failure here
++    // falls through to the default (surfaceless) path.
++    if (software) {
++        self.display = self.matchingDeviceDisplay(isSoftwareDevice, "");
++    } else if (drm_device) |wanted| {
++        self.display = self.deviceDisplay(wanted);
++    }
++
++    // The surfaceless platform works headless (no DRM master, no display
++    // server) and falls back to llvmpipe when no render node is usable.
++    if (self.display == null) {
++        if (self.getPlatformDisplayProc()) |eglGetPlatformDisplayEXT| {
++            self.display = eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, null, null);
++        }
++    }
++    if (self.display == null) self.display = self.egl.eglGetDisplay(null);
++    if (self.display == null) return Error.NoDisplay;
++
++    if (self.egl.eglInitialize(self.display, null, null) != EGL_TRUE) return Error.EglInitFailed;
++    errdefer _ = self.egl.eglTerminate(self.display);
++
++    if (self.egl.eglBindAPI(EGL_OPENGL_ES_API) != EGL_TRUE) return Error.BindApiFailed;
++
++    // All rendering goes to an FBO, so the config's surface support is
++    // irrelevant; SURFACE_TYPE 0 matches any config.
++    self.createContext(0) catch {
++        self.context = null;
++    };
++
++    var made_current = false;
++    if (self.context != null) {
++        // Requires EGL_KHR_surfaceless_context, which mesa has had for ages
++        made_current = self.egl.eglMakeCurrent(self.display, null, null, self.context) == EGL_TRUE;
++    }
++
++    if (!made_current) {
++        // Last resort: a throwaway 1x1 pbuffer just to satisfy MakeCurrent
++        if (self.context != null) _ = self.egl.eglDestroyContext(self.display, self.context);
++        try self.createContext(EGL_PBUFFER_BIT);
++        if (self.egl.eglMakeCurrent(self.display, self.surface, self.surface, self.context) != EGL_TRUE)
++            return Error.MakeCurrentFailed;
++    }
++
++    inline for (@typeInfo(GlProcs).@"struct".fields) |field| {
++        const proc = self.getGlProc(field.name) orelse return Error.MissingGlSymbol;
++        @field(self.gl, field.name) = @ptrCast(@alignCast(proc));
++    }
++
++    // ES 3.0 requires a bound VAO for drawing, even with no attributes
++    self.gl.glGenVertexArrays(1, @ptrCast(&self.vao));
++    self.gl.glBindVertexArray(self.vao);
++
++    self.gl.glGenFramebuffers(1, @ptrCast(&self.fbo));
++    self.gl.glBindFramebuffer(GL_FRAMEBUFFER, self.fbo);
++    self.gl.glGenRenderbuffers(1, @ptrCast(&self.rbo));
++    self.gl.glBindRenderbuffer(GL_RENDERBUFFER, self.rbo);
++
++    // Channel textures: shaders sampling iChannel0-3 get deterministic
++    // procedural data instead of black. Units 0/2 carry 256x256 white RGBA
++    // noise (statistically what shadertoy's stock "RGBA noise" texture is,
++    // so iq-style noise() functions work verbatim), units 1/3 a smooth fbm
++    // cloud as a rough stand-in for photo textures. Mipmapped + repeat to
++    // match shadertoy's default sampler state.
++    if (allocator_for_textures) |allocator| {
++        self.setupChannelTextures(allocator) catch {
++            // Out of memory here is survivable: fall back to 1x1 black
++            self.setupBlackChannelTextures();
++        };
++    } else {
++        self.setupBlackChannelTextures();
++    }
++
++    self.gl.glPixelStorei(GL_PACK_ALIGNMENT, 1);
++
++    return self;
++}
++
++const noise_size: usize = 256;
++
++fn setupChannelTextures(self: *Context, allocator: std.mem.Allocator) !void {
++    const white = try allocator.alloc(u8, noise_size * noise_size * 4);
++    defer allocator.free(white);
++    const fbm = try allocator.alloc(u8, noise_size * noise_size * 4);
++    defer allocator.free(fbm);
++
++    // xorshift32 with a fixed seed: same texture every boot
++    var state: u32 = 0x9E3779B9;
++    for (white) |*byte| {
++        state ^= state << 13;
++        state ^= state >> 17;
++        state ^= state << 5;
++        byte.* = @truncate(state >> 24);
++    }
++
++    // Value-noise fbm built by bilinearly upsampling the white noise at a
++    // few frequencies; wraps seamlessly because the lattice wraps
++    for (0..noise_size) |y| {
++        for (0..noise_size) |x| {
++            var sums = [3]f32{ 0.0, 0.0, 0.0 };
++            var total: f32 = 0.0;
++            var octave: usize = 0;
++            while (octave < 5) : (octave += 1) {
++                const cells: usize = @as(usize, 4) << @intCast(octave); // 4,8,...,64 lattice points
++                const weight: f32 = 1.0 / @as(f32, @floatFromInt(@as(usize, 1) << @intCast(octave)));
++                const fx = @as(f32, @floatFromInt(x)) * @as(f32, @floatFromInt(cells)) / @as(f32, @floatFromInt(noise_size));
++                const fy = @as(f32, @floatFromInt(y)) * @as(f32, @floatFromInt(cells)) / @as(f32, @floatFromInt(noise_size));
++                const x0: usize = @intFromFloat(fx);
++                const y0: usize = @intFromFloat(fy);
++                const tx = fx - @as(f32, @floatFromInt(x0));
++                const ty = fy - @as(f32, @floatFromInt(y0));
++
++                for (0..3) |c| {
++                    const v00: f32 = @floatFromInt(white[((y0 % noise_size) * noise_size + (x0 % noise_size)) * 4 + c]);
++                    const v10: f32 = @floatFromInt(white[((y0 % noise_size) * noise_size + ((x0 + 1) % noise_size)) * 4 + c]);
++                    const v01: f32 = @floatFromInt(white[(((y0 + 1) % noise_size) * noise_size + (x0 % noise_size)) * 4 + c]);
++                    const v11: f32 = @floatFromInt(white[(((y0 + 1) % noise_size) * noise_size + ((x0 + 1) % noise_size)) * 4 + c]);
++                    const value = (v00 * (1.0 - tx) + v10 * tx) * (1.0 - ty) + (v01 * (1.0 - tx) + v11 * tx) * ty;
++                    sums[c] += value * weight;
++                }
++                total += weight;
++            }
++
++            const offset = (y * noise_size + x) * 4;
++            for (0..3) |c| fbm[offset + c] = @intFromFloat(std.math.clamp(sums[c] / total, 0.0, 255.0));
++            fbm[offset + 3] = 255;
++        }
++    }
++
++    var textures: [2]GLuint = undefined;
++    self.gl.glGenTextures(2, &textures);
++    const sources = [2][]const u8{ white, fbm };
++    for (sources, 0..) |pixels, i| {
++        self.gl.glBindTexture(GL_TEXTURE_2D, textures[i]);
++        self.gl.glTexImage2D(GL_TEXTURE_2D, 0, @intCast(GL_RGBA), noise_size, noise_size, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.ptr);
++        self.gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
++        self.gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++        self.gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
++        self.gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
++        self.gl.glGenerateMipmap(GL_TEXTURE_2D);
++    }
++
++    // noise on 0/2, fbm on 1/3
++    const unit_textures = [4]GLuint{ textures[0], textures[1], textures[0], textures[1] };
++    for (unit_textures, 0..) |texture, unit| {
++        self.gl.glActiveTexture(GL_TEXTURE0 + @as(GLenum, @intCast(unit)));
++        self.gl.glBindTexture(GL_TEXTURE_2D, texture);
++    }
++}
++
++fn setupBlackChannelTextures(self: *Context) void {
++    var textures: [4]GLuint = undefined;
++    self.gl.glGenTextures(4, &textures);
++    const black = [4]u8{ 0, 0, 0, 255 };
++    for (textures, 0..) |texture, i| {
++        self.gl.glActiveTexture(GL_TEXTURE0 + @as(GLenum, @intCast(i)));
++        self.gl.glBindTexture(GL_TEXTURE_2D, texture);
++        self.gl.glTexImage2D(GL_TEXTURE_2D, 0, @intCast(GL_RGBA), 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &black);
++        self.gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++        self.gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++        self.gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
++        self.gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
++    }
++}
++
++fn createContext(self: *Context, surface_type: EGLint) Error!void {
++    const config_attribs = [_]EGLint{
++        EGL_SURFACE_TYPE,    surface_type,
++        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
++        EGL_RED_SIZE,        8,
++        EGL_GREEN_SIZE,      8,
++        EGL_BLUE_SIZE,       8,
++        EGL_ALPHA_SIZE,      8,
++        EGL_NONE,
++    };
++
++    var config: EGLConfig = null;
++    var num_configs: EGLint = 0;
++    if (self.egl.eglChooseConfig(self.display, &config_attribs, @ptrCast(&config), 1, &num_configs) != EGL_TRUE or num_configs < 1)
++        return Error.NoConfig;
++
++    const context_attribs = [_]EGLint{ EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
++    self.context = self.egl.eglCreateContext(self.display, config, null, &context_attribs);
++    if (self.context == null) return Error.NoContext;
++
++    if (surface_type == EGL_PBUFFER_BIT) {
++        const surface_attribs = [_]EGLint{ EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
++        self.surface = self.egl.eglCreatePbufferSurface(self.display, config, &surface_attribs);
++        if (self.surface == null) return Error.MakeCurrentFailed;
++    }
++}
++
++fn getGlProc(self: *Context, name: [*:0]const u8) ?*anyopaque {
++    if (self.egl.eglGetProcAddress(name)) |proc| return proc;
++
++    if (self.gles_lib == null) {
++        for (gles_candidates) |candidate| {
++            self.gles_lib = dlopen(candidate, RTLD_NOW);
++            if (self.gles_lib != null) break;
++        }
++    }
++    if (self.gles_lib != null) return dlsym(self.gles_lib, name);
++
++    return null;
++}
++
++pub fn deinit(self: *Context) void {
++    if (self.display == null) return;
++
++    _ = self.egl.eglMakeCurrent(self.display, null, null, null);
++    if (self.surface != null) _ = self.egl.eglDestroySurface(self.display, self.surface);
++    if (self.context != null) _ = self.egl.eglDestroyContext(self.display, self.context);
++    _ = self.egl.eglTerminate(self.display);
++    self.display = null;
++}
++
++pub fn renderer(self: *Context) [*:0]const u8 {
++    return self.gl.glGetString(GL_RENDERER) orelse "unknown";
++}
++
++fn setInfoLog(self: *Context, getInfoFn: anytype, object: GLuint) void {
++    var length: GLsizei = 0;
++    getInfoFn(object, @intCast(self.info_log.len), &length, &self.info_log);
++    self.info_log_len = @min(@as(usize, @intCast(@max(length, 0))), self.info_log.len);
++}
++
++fn compileShader(self: *Context, shader_type: GLenum, sources: []const []const u8) Error!GLuint {
++    const shader = self.gl.glCreateShader(shader_type);
++    if (shader == 0) return Error.CompileFailed;
++    errdefer self.gl.glDeleteShader(shader);
++
++    var pointers: [4][*]const u8 = undefined;
++    var lengths: [4]GLint = undefined;
++    for (sources, 0..) |source, i| {
++        pointers[i] = source.ptr;
++        lengths[i] = @intCast(source.len);
++    }
++
++    self.gl.glShaderSource(shader, @intCast(sources.len), &pointers, &lengths);
++    self.gl.glCompileShader(shader);
++
++    var status: GLint = 0;
++    self.gl.glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
++    if (status == 0) {
++        self.setInfoLog(self.gl.glGetShaderInfoLog, shader);
++        return Error.CompileFailed;
++    }
++
++    return shader;
++}
++
++/// Compiles the shadertoy-format source (must define mainImage) and prepares
++/// it for rendering. On CompileFailed/LinkFailed, info_log holds the details.
++pub fn buildProgram(self: *Context, user_source: []const u8) Error!void {
++    self.info_log_len = 0;
++
++    const vertex_shader = try self.compileShader(GL_VERTEX_SHADER, &.{vertex_source});
++    defer self.gl.glDeleteShader(vertex_shader);
++
++    const fragment_shader = try self.compileShader(GL_FRAGMENT_SHADER, &.{
++        fragment_preamble,
++        user_source,
++        fragment_epilogue,
++    });
++    defer self.gl.glDeleteShader(fragment_shader);
++
++    const program = self.gl.glCreateProgram();
++    if (program == 0) return Error.LinkFailed;
++    errdefer self.gl.glDeleteProgram(program);
++
++    self.gl.glAttachShader(program, vertex_shader);
++    self.gl.glAttachShader(program, fragment_shader);
++    self.gl.glLinkProgram(program);
++
++    var status: GLint = 0;
++    self.gl.glGetProgramiv(program, GL_LINK_STATUS, &status);
++    if (status == 0) {
++        self.setInfoLog(self.gl.glGetProgramInfoLog, program);
++        return Error.LinkFailed;
++    }
++
++    self.program = program;
++    self.gl.glUseProgram(program);
++
++    self.u_resolution = self.gl.glGetUniformLocation(program, "iResolution");
++    self.u_time = self.gl.glGetUniformLocation(program, "iTime");
++    self.u_time_delta = self.gl.glGetUniformLocation(program, "iTimeDelta");
++    self.u_frame_rate = self.gl.glGetUniformLocation(program, "iFrameRate");
++    self.u_frame = self.gl.glGetUniformLocation(program, "iFrame");
++    self.u_mouse = self.gl.glGetUniformLocation(program, "iMouse");
++    self.u_date = self.gl.glGetUniformLocation(program, "iDate");
++    self.u_sample_rate = self.gl.glGetUniformLocation(program, "iSampleRate");
++
++    const channel_names = [4][*:0]const u8{ "iChannel0", "iChannel1", "iChannel2", "iChannel3" };
++    for (channel_names, 0..) |name, i| {
++        self.gl.glUniform1i(self.gl.glGetUniformLocation(program, name), @intCast(i));
++    }
++
++    const channel_resolutions = [12]GLfloat{ 256, 256, 1, 256, 256, 1, 256, 256, 1, 256, 256, 1 };
++    self.gl.glUniform3fv(self.gl.glGetUniformLocation(program, "iChannelResolution"), 4, &channel_resolutions);
++}
++
++/// (Re)sizes the offscreen color buffer. Cheap enough to call on every
++/// terminal resize.
++pub fn resize(self: *Context, width: usize, height: usize) Error!void {
++    self.width = @intCast(@max(width, 1));
++    self.height = @intCast(@max(height, 1));
++
++    self.gl.glBindRenderbuffer(GL_RENDERBUFFER, self.rbo);
++    self.gl.glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, self.width, self.height);
++    self.gl.glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, self.rbo);
++
++    if (self.gl.glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
++        return Error.FramebufferIncomplete;
++}
++
++pub const FrameInfo = struct {
++    time: f32,
++    time_delta: f32,
++    frame: i32,
++    date: [4]f32,
++};
++
++/// Draws one frame and reads it back as tightly-packed RGBA8. Row order is
++/// OpenGL's: the first row is the BOTTOM of the image.
++pub fn render(self: *Context, info: FrameInfo, pixels: []u8) Error!void {
++    if (self.program == 0) return Error.NoProgram;
++    std.debug.assert(pixels.len >= @as(usize, @intCast(self.width * self.height * 4)));
++
++    self.gl.glUseProgram(self.program);
++    self.gl.glUniform3f(self.u_resolution, @floatFromInt(self.width), @floatFromInt(self.height), 1.0);
++    self.gl.glUniform1f(self.u_time, info.time);
++    self.gl.glUniform1f(self.u_time_delta, @max(info.time_delta, 0.001));
++    self.gl.glUniform1f(self.u_frame_rate, 1.0 / @max(info.time_delta, 0.001));
++    self.gl.glUniform1i(self.u_frame, info.frame);
++    self.gl.glUniform4f(self.u_mouse, 0.0, 0.0, 0.0, 0.0);
++    self.gl.glUniform4f(self.u_date, info.date[0], info.date[1], info.date[2], info.date[3]);
++    self.gl.glUniform1f(self.u_sample_rate, 44100.0);
++
++    self.gl.glBindFramebuffer(GL_FRAMEBUFFER, self.fbo);
++    self.gl.glViewport(0, 0, self.width, self.height);
++    self.gl.glBindVertexArray(self.vao);
++    self.gl.glDrawArrays(GL_TRIANGLES, 0, 3);
++    self.gl.glReadPixels(0, 0, self.width, self.height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.ptr);
++}
+diff -ruN ly-base/src/animations/Shader.zig ly-work/src/animations/Shader.zig
+--- ly-base/src/animations/Shader.zig	1970-01-01 01:00:00.000000000 +0100
++++ ly-work/src/animations/Shader.zig	2026-08-30 00:37:39.753584840 +0200
+@@ -0,0 +1,540 @@
++const std = @import("std");
++const Allocator = std.mem.Allocator;
++
++const ly_ui = @import("ly-ui");
++const Cell = ly_ui.Cell;
++const TerminalBuffer = ly_ui.TerminalBuffer;
++const Widget = ly_ui.Widget;
++
++const ly_core = ly_ui.ly_core;
++const interop = ly_core.interop;
++const TimeOfDay = interop.TimeOfDay;
++const LogFile = ly_core.LogFile;
++
++const enums = @import("../enums.zig");
++const ShaderCellMode = enums.ShaderCellMode;
++const ShaderGl = @import("ShaderGl.zig");
++
++const Shader = @This();
++
++const math = std.math;
++
++// Generic shadertoy player: renders an arbitrary shadertoy-format fragment
++// shader (a file defining mainImage) offscreen via EGL at terminal-subpixel
++// resolution and quantizes the result to cells. Every failure mode (no EGL
++// stack, missing file, GLSL compile error) is non-fatal: it gets logged to
++// the ly log file and the greeter simply runs without a background.
++//
++// A cell is treated as 1x2 "subpixels" (half-block geometry). With
++// supersampling S, the GL framebuffer is (width*S) x (height*2*S).
++
++// glibc struct tm; time_t is i64 on every 64-bit platform ly targets
++const Tm = extern struct {
++    tm_sec: c_int,
++    tm_min: c_int,
++    tm_hour: c_int,
++    tm_mday: c_int,
++    tm_mon: c_int,
++    tm_year: c_int,
++    tm_wday: c_int,
++    tm_yday: c_int,
++    tm_isdst: c_int,
++    tm_gmtoff: c_long,
++    tm_zone: ?[*:0]const u8,
++};
++extern "c" fn localtime_r(timep: *const i64, result: *Tm) ?*Tm;
++
++// The standard Linux VT palette. Cells quantized to exactly these values
++// survive the kernel's truecolor-SGR-to-16-colors mapping without surprises,
++// and look identical in a graphical terminal.
++const vt_palette = [16][3]f32{
++    .{ 0, 0, 0 },       .{ 170, 0, 0 },     .{ 0, 170, 0 },   .{ 170, 85, 0 },
++    .{ 0, 0, 170 },     .{ 170, 0, 170 },   .{ 0, 170, 170 }, .{ 170, 170, 170 },
++    .{ 85, 85, 85 },    .{ 255, 85, 85 },   .{ 85, 255, 85 }, .{ 255, 255, 85 },
++    .{ 85, 85, 255 },   .{ 255, 85, 255 },  .{ 85, 255, 255 }, .{ 255, 255, 255 },
++};
++
++// Shade glyphs mix fg over bg with these coverages (space shows pure bg)
++const shade_chars = [5]u32{ ' ', 0x2591, 0x2592, 0x2593, 0x2588 };
++const shade_coverage = [5]f32{ 0.0, 0.25, 0.5, 0.75, 1.0 };
++const upper_half_block: u32 = 0x2580;
++
++// In termbox2's truecolor mode 0x000000 means "default color"; true black
++// needs the HI_BLACK styling flag instead
++const hi_black: u32 = 0x20000000;
++
++const bayer4 = [4][4]f32{
++    .{ 0, 8, 2, 10 },
++    .{ 12, 4, 14, 6 },
++    .{ 3, 11, 1, 9 },
++    .{ 15, 7, 13, 5 },
++};
++
++const shade16_dither: f32 = 20.0;
++const halfblock16_dither: f32 = 36.0;
++
++const lut_empty: u16 = 0xFFFF;
++const lut_size: usize = 32768; // 5 bits per channel
++
++instance: ?Widget = null,
++start_time: TimeOfDay,
++allocator: Allocator,
++io: std.Io,
++log_file: *LogFile,
++terminal_buffer: *TerminalBuffer,
++mode: ShaderCellMode,
++supersample: usize,
++ctx: ?ShaderGl,
++cells: []Cell,
++pixels: []u8,
++// (fg, bg, shade) choice per quantized rgb555 target, filled lazily
++lut_shade: []u16,
++// nearest VT palette index per quantized rgb555 value
++lut_color16: []u8,
++px_w: usize,
++px_h: usize,
++start_us: i64,
++next_compute_us: i64,
++interval_us: i64,
++last_frame_time: f32,
++frame_index: i32,
++render_failed: bool,
++animate: *bool,
++timeout_sec: u12,
++frame_delay: u16,
++
++fn nowMicros() ?i64 {
++    const tod = interop.getTimeOfDay() catch return null;
++    return tod.seconds * 1_000_000 + tod.microseconds;
++}
++
++pub fn init(
++    allocator: Allocator,
++    io: std.Io,
++    terminal_buffer: *TerminalBuffer,
++    log_file: *LogFile,
++    shader_path: ?[]const u8,
++    egl_lib: ?[:0]const u8,
++    drm_device: ?[:0]const u8,
++    software: bool,
++    cell_mode: ShaderCellMode,
++    supersample: u8,
++    fps: u8,
++    full_color: bool,
++    animate: *bool,
++    timeout_sec: u12,
++    frame_delay: u16,
++) !Shader {
++    var self = Shader{
++        .start_time = try interop.getTimeOfDay(),
++        .allocator = allocator,
++        .io = io,
++        .log_file = log_file,
++        .terminal_buffer = terminal_buffer,
++        .mode = cell_mode,
++        .supersample = math.clamp(@as(usize, supersample), 1, 4),
++        .ctx = null,
++        .cells = &.{},
++        .pixels = &.{},
++        .lut_shade = &.{},
++        .lut_color16 = &.{},
++        .px_w = 0,
++        .px_h = 0,
++        .start_us = nowMicros() orelse 0,
++        .next_compute_us = math.minInt(i64),
++        .interval_us = @divTrunc(1_000_000, @as(i64, math.clamp(@as(i64, fps), 1, 60))),
++        .last_frame_time = 0.0,
++        .frame_index = 0,
++        .render_failed = false,
++        .animate = animate,
++        .timeout_sec = timeout_sec,
++        .frame_delay = frame_delay,
++    };
++
++    if (!full_color) {
++        self.logError("the shader animation requires full_color = true", .{});
++        return self;
++    }
++
++    const path = shader_path orelse {
++        self.logError("animation = shader requires shader_path to be set", .{});
++        return self;
++    };
++
++    const source = readShaderFile(allocator, io, path) catch |err| {
++        self.logError("failed to read shader_path '{s}': {s}", .{ path, @errorName(err) });
++        return self;
++    };
++    defer allocator.free(source);
++
++    var ctx = ShaderGl.init(
++        allocator,
++        if (egl_lib) |lib| lib.ptr else null,
++        if (drm_device) |device| device.ptr else null,
++        software,
++    ) catch |err| {
++        self.logError("failed to bring up EGL/GLES ({s}); no shader background", .{@errorName(err)});
++        return self;
++    };
++
++    ctx.buildProgram(source) catch |err| {
++        self.logError("shader '{s}' failed: {s}: {s}", .{ path, @errorName(err), ctx.info_log[0..ctx.info_log_len] });
++        ctx.deinit();
++        return self;
++    };
++
++    self.logInfo("shader '{s}' compiled, rendering on '{s}'", .{ path, ctx.renderer() });
++
++    self.ctx = ctx;
++    self.allocateBuffers() catch |err| {
++        self.killContext();
++        return err;
++    };
++    self.buildColorLut();
++
++    return self;
++}
++
++/// False when shader setup failed and the caller should use a fallback
++/// animation instead (details are in the ly log).
++pub fn isAlive(self: *const Shader) bool {
++    return self.ctx != null;
++}
++
++fn readShaderFile(allocator: Allocator, io: std.Io, path: []const u8) ![]u8 {
++    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
++    defer file.close(io);
++
++    const stat = try file.stat(io);
++    if (stat.size > 1 << 20) return error.ShaderFileTooBig;
++
++    var read_buffer: [4096]u8 = undefined;
++    var reader = file.reader(io, &read_buffer);
++    return try reader.interface.readAlloc(allocator, @intCast(stat.size));
++}
++
++fn logError(self: *Shader, comptime message: []const u8, args: anytype) void {
++    self.log_file.err(self.io, "shader", message, args) catch {};
++}
++
++fn logInfo(self: *Shader, comptime message: []const u8, args: anytype) void {
++    self.log_file.info(self.io, "shader", message, args) catch {};
++}
++
++fn killContext(self: *Shader) void {
++    if (self.ctx) |*ctx| {
++        ctx.deinit();
++        self.ctx = null;
++    }
++}
++
++fn allocateBuffers(self: *Shader) !void {
++    const width = self.terminal_buffer.width;
++    const height = self.terminal_buffer.height;
++
++    self.px_w = @max(width, 1) * self.supersample;
++    self.px_h = @max(height, 1) * 2 * self.supersample;
++
++    if (self.cells.len != 0) self.allocator.free(self.cells);
++    self.cells = try self.allocator.alloc(Cell, width * height);
++    @memset(self.cells, Cell.init(0, 0, 0));
++
++    if (self.pixels.len != 0) self.allocator.free(self.pixels);
++    self.pixels = try self.allocator.alloc(u8, self.px_w * self.px_h * 4);
++
++    if (self.lut_shade.len == 0) self.lut_shade = try self.allocator.alloc(u16, lut_size);
++    @memset(self.lut_shade, lut_empty);
++
++    if (self.lut_color16.len == 0) self.lut_color16 = try self.allocator.alloc(u8, lut_size);
++
++    if (self.ctx) |*ctx| try ctx.resize(self.px_w, self.px_h);
++
++    self.next_compute_us = math.minInt(i64);
++}
++
++fn buildColorLut(self: *Shader) void {
++    for (self.lut_color16, 0..) |*entry, key| {
++        const target = keyToRgb(key);
++        var best_dist = math.floatMax(f32);
++        for (vt_palette, 0..) |candidate, i| {
++            const dist = colorDistance(candidate, target);
++            if (dist < best_dist) {
++                best_dist = dist;
++                entry.* = @intCast(i);
++            }
++        }
++    }
++}
++
++pub fn widget(self: *Shader) *Widget {
++    if (self.instance) |*instance| return instance;
++    self.instance = Widget.init(
++        "Shader",
++        null,
++        self,
++        deinit,
++        realloc,
++        draw,
++        update,
++        null,
++        calculateTimeout,
++    );
++    return &self.instance.?;
++}
++
++fn deinit(self: *Shader) void {
++    self.killContext();
++    if (self.cells.len != 0) self.allocator.free(self.cells);
++    if (self.pixels.len != 0) self.allocator.free(self.pixels);
++    if (self.lut_shade.len != 0) self.allocator.free(self.lut_shade);
++    if (self.lut_color16.len != 0) self.allocator.free(self.lut_color16);
++}
++
++fn realloc(self: *Shader) !void {
++    if (self.ctx == null) return;
++
++    self.allocateBuffers() catch |err| {
++        self.killContext();
++        return err;
++    };
++}
++
++fn update(self: *Shader, _: *anyopaque) !void {
++    const time = try interop.getTimeOfDay();
++
++    if (self.timeout_sec > 0 and time.seconds - self.start_time.seconds > self.timeout_sec) {
++        self.animate.* = false;
++    }
++}
++
++fn calculateTimeout(self: *Shader, _: *anyopaque) !?usize {
++    if (self.ctx == null) return null;
++    return self.frame_delay;
++}
++
++fn draw(self: *Shader) void {
++    if (!self.animate.*) return;
++    if (self.ctx == null) return;
++
++    const width = self.terminal_buffer.width;
++    const height = self.terminal_buffer.height;
++    if (self.cells.len != width * height) realloc(self) catch return;
++
++    const now = nowMicros() orelse self.start_us;
++    if (now >= self.next_compute_us) {
++        self.computeFrame(now, width, height);
++        // shaders slower than the target frame rate (heavy raymarchers on
++        // llvmpipe) get at least 2x their render time as idle gap so the
++        // greeter's input handling never starves
++        const after = nowMicros() orelse now;
++        self.next_compute_us = now + @max(self.interval_us, (after - now) * 2);
++    }
++
++    var i: usize = 0;
++    for (0..height) |y| {
++        for (0..width) |x| {
++            self.cells[i].put(x, y);
++            i += 1;
++        }
++    }
++}
++
++fn computeFrame(self: *Shader, now: i64, width: usize, height: usize) void {
++    const ctx = if (self.ctx) |*c| c else return;
++
++    const time: f32 = @as(f32, @floatFromInt(now - self.start_us)) / 1_000_000.0;
++    const time_delta = if (self.frame_index == 0)
++        @as(f32, @floatFromInt(self.interval_us)) / 1_000_000.0
++    else
++        time - self.last_frame_time;
++
++    ctx.render(.{
++        .time = time,
++        .time_delta = time_delta,
++        .frame = self.frame_index,
++        .date = currentDate(now),
++    }, self.pixels) catch |err| {
++        if (!self.render_failed) {
++            self.render_failed = true;
++            self.logError("shader rendering failed: {s}; disabling background", .{@errorName(err)});
++        }
++        self.killContext();
++        @memset(self.cells, Cell.init(0, 0, 0));
++        return;
++    };
++
++    self.last_frame_time = time;
++    self.frame_index +%= 1;
++
++    for (0..height) |y| {
++        for (0..width) |x| {
++            self.cells[y * width + x] = switch (self.mode) {
++                .shade16 => self.quantizeShade16(x, y),
++                .halfblock => self.quantizeHalfblock(x, y),
++                .halfblock16 => self.quantizeHalfblock16(x, y),
++            };
++        }
++    }
++}
++
++fn currentDate(now_us: i64) [4]f32 {
++    const seconds: i64 = @divFloor(now_us, 1_000_000);
++    var tm: Tm = undefined;
++    if (localtime_r(&seconds, &tm) == null) return .{ 1970, 0, 1, 0 };
++
++    const second_of_day = @as(f32, @floatFromInt(@as(i64, tm.tm_hour) * 3600 + @as(i64, tm.tm_min) * 60 + tm.tm_sec)) +
++        @as(f32, @floatFromInt(@mod(now_us, 1_000_000))) / 1_000_000.0;
++
++    return .{
++        @floatFromInt(tm.tm_year + 1900),
++        @floatFromInt(tm.tm_mon),
++        @floatFromInt(tm.tm_mday),
++        second_of_day,
++    };
++}
++
++// Average of the supersample x supersample block whose top-left subpixel (in
++// top-down image coordinates) is (col0, img_row0). The GL readback is
++// bottom-up, hence the row flip.
++fn averageBlock(self: *Shader, col0: usize, img_row0: usize) [3]f32 {
++    var sums = [3]u32{ 0, 0, 0 };
++    for (0..self.supersample) |dy| {
++        const gl_row = self.px_h - 1 - (img_row0 + dy);
++        const row_base = gl_row * self.px_w * 4;
++        for (0..self.supersample) |dx| {
++            const offset = row_base + (col0 + dx) * 4;
++            sums[0] += self.pixels[offset];
++            sums[1] += self.pixels[offset + 1];
++            sums[2] += self.pixels[offset + 2];
++        }
++    }
++
++    const count: f32 = @floatFromInt(self.supersample * self.supersample);
++    return .{
++        @as(f32, @floatFromInt(sums[0])) / count,
++        @as(f32, @floatFromInt(sums[1])) / count,
++        @as(f32, @floatFromInt(sums[2])) / count,
++    };
++}
++
++// "Redmean" color distance: much better hue separation than luma-weighted
++// RGB (whose tiny blue weight loves substituting magenta for red and cyan
++// for blue in dithered blends)
++fn colorDistance(a: [3]f32, b: [3]f32) f32 {
++    const mean_r = (a[0] + b[0]) * 0.5;
++    const dr = a[0] - b[0];
++    const dg = a[1] - b[1];
++    const db = a[2] - b[2];
++    return (2.0 + mean_r / 256.0) * dr * dr + 4.0 * dg * dg + (2.0 + (255.0 - mean_r) / 256.0) * db * db;
++}
++
++fn keyToRgb(key: usize) [3]f32 {
++    const r5 = (key >> 10) & 31;
++    const g5 = (key >> 5) & 31;
++    const b5 = key & 31;
++    return .{
++        @floatFromInt((r5 << 3) | (r5 >> 2)),
++        @floatFromInt((g5 << 3) | (g5 >> 2)),
++        @floatFromInt((b5 << 3) | (b5 >> 2)),
++    };
++}
++
++fn rgbToKey(rgb: [3]f32) usize {
++    const r: usize = @intFromFloat(math.clamp(rgb[0], 0.0, 255.0));
++    const g: usize = @intFromFloat(math.clamp(rgb[1], 0.0, 255.0));
++    const b: usize = @intFromFloat(math.clamp(rgb[2], 0.0, 255.0));
++    return ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
++}
++
++fn dither(rgb: [3]f32, x: usize, y: usize, strength: f32) [3]f32 {
++    const offset = (bayer4[y & 3][x & 3] - 7.5) / 16.0 * strength;
++    return .{ rgb[0] + offset, rgb[1] + offset, rgb[2] + offset };
++}
++
++fn paletteColor(index: usize) u32 {
++    if (index == 0) return hi_black;
++    const rgb = vt_palette[index];
++    return (@as(u32, @intFromFloat(rgb[0])) << 16) |
++        (@as(u32, @intFromFloat(rgb[1])) << 8) |
++        @as(u32, @intFromFloat(rgb[2]));
++}
++
++fn trueColor(rgb: [3]f32) u32 {
++    const r: u32 = @intFromFloat(math.clamp(rgb[0], 0.0, 255.0));
++    const g: u32 = @intFromFloat(math.clamp(rgb[1], 0.0, 255.0));
++    const b: u32 = @intFromFloat(math.clamp(rgb[2], 0.0, 255.0));
++    const color = (r << 16) | (g << 8) | b;
++    return if (color == 0) hi_black else color;
++}
++
++// One truecolor half-block per cell: exact colors on graphical terminals,
++// kernel-quantized (unevenly) on the VT
++fn quantizeHalfblock(self: *Shader, x: usize, y: usize) Cell {
++    const col0 = x * self.supersample;
++    const row0 = y * 2 * self.supersample;
++    const top = self.averageBlock(col0, row0);
++    const bottom = self.averageBlock(col0, row0 + self.supersample);
++    return Cell.init(upper_half_block, trueColor(top), trueColor(bottom));
++}
++
++// Half-blocks quantized+dithered to the 16-color VT palette: doubles the
++// vertical resolution but each half is a flat palette color
++fn quantizeHalfblock16(self: *Shader, x: usize, y: usize) Cell {
++    const col0 = x * self.supersample;
++    const row0 = y * 2 * self.supersample;
++    const top = dither(self.averageBlock(col0, row0), x, y * 2, halfblock16_dither);
++    const bottom = dither(self.averageBlock(col0, row0 + self.supersample), x, y * 2 + 1, halfblock16_dither);
++    return Cell.init(
++        upper_half_block,
++        paletteColor(self.lut_color16[rgbToKey(top)]),
++        paletteColor(self.lut_color16[rgbToKey(bottom)]),
++    );
++}
++
++// One target color per cell approximated by a shade glyph blending two VT
++// palette colors: smoother gradients, balatro-patch aesthetics
++fn quantizeShade16(self: *Shader, x: usize, y: usize) Cell {
++    const col0 = x * self.supersample;
++    const row0 = y * 2 * self.supersample;
++    const top = self.averageBlock(col0, row0);
++    const bottom = self.averageBlock(col0, row0 + self.supersample);
++    const average = [3]f32{
++        (top[0] + bottom[0]) * 0.5,
++        (top[1] + bottom[1]) * 0.5,
++        (top[2] + bottom[2]) * 0.5,
++    };
++
++    const key = rgbToKey(dither(average, x, y, shade16_dither));
++    if (self.lut_shade[key] == lut_empty) self.lut_shade[key] = bestShadeCell(keyToRgb(key));
++
++    const packed_choice = self.lut_shade[key];
++    const fg: usize = packed_choice / 80;
++    const bg: usize = (packed_choice % 80) / 5;
++    const shade: usize = packed_choice % 5;
++
++    return Cell.init(shade_chars[shade], paletteColor(fg), paletteColor(bg));
++}
++
++fn bestShadeCell(target: [3]f32) u16 {
++    var best_dist = math.floatMax(f32);
++    var best: u16 = 0;
++
++    for (vt_palette, 0..) |fg_rgb, fg| {
++        for (vt_palette, 0..) |bg_rgb, bg| {
++            for (shade_coverage, 0..) |coverage, shade| {
++                const blend = [3]f32{
++                    fg_rgb[0] * coverage + bg_rgb[0] * (1.0 - coverage),
++                    fg_rgb[1] * coverage + bg_rgb[1] * (1.0 - coverage),
++                    fg_rgb[2] * coverage + bg_rgb[2] * (1.0 - coverage),
++                };
++                const dist = colorDistance(blend, target);
++                if (dist < best_dist) {
++                    best_dist = dist;
++                    best = @intCast(fg * 80 + bg * 5 + shade);
++                }
++            }
++        }
++    }
++
++    return best;
++}
+diff -ruN ly-base/src/config/Config.zig ly-work/src/config/Config.zig
+--- ly-base/src/config/Config.zig	2026-08-29 23:50:01.112586149 +0200
++++ ly-work/src/config/Config.zig	2026-08-30 00:12:31.081002159 +0200
+@@ -6,6 +6,7 @@
+ const ViMode = enums.ViMode;
+ const Bigclock = enums.Bigclock;
+ const DurOffsetAlignment = enums.DurOffsetAlignment;
++const ShaderCellMode = enums.ShaderCellMode;
+ 
+ allow_empty_password: bool = true,
+ animation: Animation = .none,
+@@ -86,6 +87,13 @@
+ service_name: [:0]const u8 = "ly",
+ session_log: ?[]const u8 = "ly-session.log",
+ setup_cmd: []const u8 = build_options.config_directory ++ "/ly/setup.sh",
++shader_cell_mode: ShaderCellMode = .shade16,
++shader_drm_device: ?[:0]const u8 = null,
++shader_egl_lib: ?[:0]const u8 = null,
++shader_fps: u8 = 30,
++shader_path: ?[]const u8 = null,
++shader_software: bool = false,
++shader_supersample: u8 = 2,
+ shell: bool = true,
+ show_password_key: []const u8 = "F7",
+ show_tty: bool = false,
+diff -ruN ly-base/src/enums.zig ly-work/src/enums.zig
+--- ly-base/src/enums.zig	2026-08-29 23:50:01.112599855 +0200
++++ ly-work/src/enums.zig	2026-08-29 23:53:49.125579938 +0200
+@@ -8,6 +8,13 @@
+     gameoflife,
+     dur_file,
+     balatro,
++    shader,
++};
++
++pub const ShaderCellMode = enum {
++    shade16,
++    halfblock,
++    halfblock16,
+ };
+ 
+ pub const DisplayServer = enum {
+diff -ruN ly-base/src/main.zig ly-work/src/main.zig
+--- ly-base/src/main.zig	2026-08-29 23:50:01.112615394 +0200
++++ ly-work/src/main.zig	2026-08-30 00:12:33.202029803 +0200
+@@ -25,6 +25,7 @@
+ 
+ const Balatro = @import("animations/Balatro.zig");
+ const Cascade = @import("animations/Cascade.zig");
++const Shader = @import("animations/Shader.zig");
+ const ColorMix = @import("animations/ColorMix.zig");
+ const Doom = @import("animations/Doom.zig");
+ const DurFile = @import("animations/DurFile.zig");
+@@ -1091,6 +1092,42 @@
+             );
+             animation = balatro.widget();
+         },
++        .shader => {
++            var shader = try Shader.init(
++                state.allocator,
++                state.io,
++                &state.buffer,
++                &state.log_file,
++                state.config.shader_path,
++                state.config.shader_egl_lib,
++                state.config.shader_drm_device,
++                state.config.shader_software,
++                state.config.shader_cell_mode,
++                state.config.shader_supersample,
++                state.config.shader_fps,
++                state.config.full_color,
++                &state.animate,
++                state.config.animation_timeout_sec,
++                state.config.animation_frame_delay,
++            );
++            if (shader.isAlive()) {
++                animation = shader.widget();
++            } else {
++                // Never lose the background over a broken shader setup:
++                // fall back to the built-in balatro animation
++                var fallback = try Balatro.init(
++                    state.allocator,
++                    &state.buffer,
++                    state.config.balatro_col1,
++                    state.config.balatro_col2,
++                    state.config.balatro_col3,
++                    &state.animate,
++                    state.config.animation_timeout_sec,
++                    state.config.animation_frame_delay,
++                );
++                animation = fallback.widget();
++            }
++        },
+     }
+     defer if (animation) |a| a.deinit();
+ 

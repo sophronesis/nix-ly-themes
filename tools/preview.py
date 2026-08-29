@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# regenerates ../preview.png - a frame of the balatro animation rendered two
+# regenerates ../previews/balatro.png - a frame of the balatro animation rendered two
 # ways: exact truecolor (left) and the linux VT's 16-color approximation of
 # the same dithered cells (right), which is what the greeter actually shows.
 # stdlib only. shader math mirrors src/animations/Balatro.zig from the patch,
@@ -135,7 +135,7 @@ def main():
                 line.extend(tuple(int(qfg[c] * cov + qbg[c] * (1 - cov)) for c in range(3)) * CW)
             rows.append(line)
 
-    out = __file__.rsplit("/", 2)[0] + "/preview.png"
+    out = __file__.rsplit("/", 2)[0] + "/previews/balatro.png"
     write_png(out, W * CW * 2 + 8, H * CH, rows)
     print(f"wrote {out}")
 
