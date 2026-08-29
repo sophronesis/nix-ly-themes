@@ -12,7 +12,7 @@ Two source patches on top of stock ly:
 | ![balatro](previews/balatro.png) | ![blackhole truecolor](previews/blackhole-truecolor.png) |
 | *balatro: truecolor vs the VT's 16-color rendering* | *gargantua black hole, truecolor half-blocks* |
 | ![blackhole vt16](previews/blackhole-vt16.png) | ![plasma vt16](previews/plasma-vt16.png) |
-| *gargantua, dithered to the 16 VT colors (`halfblock16`)* | *plasma, `halfblock16`* |
+| *gargantua in `vt16` @ saturation 1.6 (true console colors)* | *plasma, `halfblock16`* |
 
 ## usage
 
@@ -56,8 +56,9 @@ What the shader animation provides:
 | `ly-themes.theme` | `"balatro"` | built-in theme; `balatro-gl` is the Balatro GLSL through the shader engine instead of the CPU port |
 | `ly-themes.shader` | `null` | custom shadertoy-format shader (path or inline GLSL), overrides `theme` |
 | `ly-themes.gpu` | `false` | `false` = llvmpipe on CPU, never opens a GPU (light shaders ~30% of one core; the black hole wants a GPU); `true` = mesa picks a render node (careful: on hybrid laptops that can wake the dGPU); `"/dev/dri/..."` = pin a card (by-path symlinks fine, ~5% of one core for the black hole on an iGPU) |
-| `ly-themes.cellMode` | `"halfblock16"` | `halfblock16` = ▀ dithered to the 16 VT colors; `shade16` = ░▒▓█ blends (safest console glyphs); `halfblock` = truecolor (for kmscon/graphical terminals; the raw VT bands it) |
+| `ly-themes.cellMode` | `"vt16"` | `vt16` = true 16-color console mode: fg from all 16, bg from the 8 the kernel VT can render, ▀ + dithered ░▒▓█ blends; `halfblock16` = ▀ dithered to 16 colors for both halves (raw VT dims bright bottom halves); `shade16` = ░▒▓█ blends only (safest glyphs); `halfblock` = truecolor (kmscon/graphical terminals) |
 | `ly-themes.fps` | `30` | frame-rate cap; slow frames self-pace so typing stays responsive |
+| `ly-themes.saturation` | `"1.0"` | chroma scale before quantization: <1 towards grayscale, >1 pushes weak tints onto the colored palette entries (the black hole looks great at `"1.6"`) |
 | `ly-themes.supersample` | `2` | shader renders at `(cells*S) x (cells*2*S)` px, box-filtered down |
 
 Balatro colors stay runtime config (`0xRRGGBB`, `0x20000000` = termbox true black):

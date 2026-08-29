@@ -113,16 +113,35 @@
             };
 
             cellMode = lib.mkOption {
-              type = lib.types.enum [ "halfblock16" "shade16" "halfblock" ];
-              default = "halfblock16";
+              type = lib.types.enum [ "vt16" "halfblock16" "shade16" "halfblock" ];
+              default = "vt16";
               description = ''
-                How shader pixels map to terminal cells. `halfblock16`:
-                upper-half-blocks dithered to the 16 VT colors (best on the
-                console; needs U+2580 in the console font). `shade16`: one
-                color per cell approximated with dithered ░▒▓█ blends (safest
-                glyph set). `halfblock`: truecolor half-blocks (gorgeous in
-                kmscon/graphical terminals; the kernel VT bands it to 16
-                colors without dithering).
+                How shader pixels map to terminal cells. `vt16`: true
+                16-color console mode - fg from all 16 VT colors, bg only
+                from the 8 the kernel VT can actually render (bright
+                backgrounds don't exist there), upper-half-blocks plus
+                dithered shade blends; the best fit for the raw console.
+                `halfblock16`: half-blocks dithered to the VT palette, but
+                assuming 16 bg colors (the raw VT dims bright bottom
+                halves). `shade16`: one color per cell approximated with
+                dithered ░▒▓█ blends (safest glyph set). `halfblock`:
+                truecolor half-blocks (gorgeous in kmscon/graphical
+                terminals; the kernel VT bands it to 16 colors without
+                dithering).
+              '';
+            };
+
+            saturation = lib.mkOption {
+              type = lib.types.str;
+              default = "1.0";
+              example = "1.6";
+              description = ''
+                Chroma scale (0.0-2.0) applied before cell quantization.
+                Below 1.0 pulls tinted near-monochrome shaders towards clean
+                grayscale (weak tints otherwise dither into scattered
+                saturated cells on a 16-color palette); above 1.0 pushes
+                weak tints onto the colored palette entries - e.g. 1.6 makes
+                the black hole's blue/warm glow vivid in 16 colors.
               '';
             };
 
@@ -158,6 +177,7 @@
                 shader_cell_mode = lib.mkDefault cfg.cellMode;
                 shader_fps = lib.mkDefault cfg.fps;
                 shader_supersample = lib.mkDefault cfg.supersample;
+                shader_saturation = lib.mkDefault cfg.saturation;
               } // lib.optionalAttrs (lib.isString cfg.gpu) {
                 shader_drm_device = lib.mkDefault cfg.gpu;
               });

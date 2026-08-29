@@ -1,6 +1,6 @@
 diff -ruN ly-base/res/config.ini ly-work/res/config.ini
---- ly-base/res/config.ini	2026-08-29 23:50:01.112202688 +0200
-+++ ly-work/res/config.ini	2026-08-30 00:12:37.325083572 +0200
+--- ly-base/res/config.ini	2026-08-30 01:09:43.951124965 +0200
++++ ly-work/res/config.ini	2026-08-30 01:17:19.388273330 +0200
 @@ -26,6 +26,7 @@
  # gameoflife -> John Conway's Game of Life
  # dur_file -> .dur file format (https://github.com/cmang/durdraw/tree/master)
@@ -9,7 +9,7 @@ diff -ruN ly-base/res/config.ini ly-work/res/config.ini
  animation = none
  
  # Delay between each animation frame in milliseconds
-@@ -141,6 +142,44 @@
+@@ -141,6 +142,53 @@
  balatro_col2 = 0x000055B4
  balatro_col3 = 0x20000000
  
@@ -39,11 +39,15 @@ diff -ruN ly-base/res/config.ini ly-work/res/config.ini
 +#shader_drm_device = /dev/dri/renderD128
 +
 +# How the shader image maps to cells:
++# vt16        -> true 16-color console mode: fg from all 16 VT colors, bg
++#                only from the 8 the kernel VT can actually render, using
++#                half-blocks + dithered shade blends (best on the console)
 +# shade16     -> one color per cell out of the 16 VT colors, approximated
-+#                with dithering + shade glyphs (best bet on the console)
++#                with dithering + shade glyphs (safest glyph set)
 +# halfblock   -> two truecolor pixels per cell via upper-half-blocks (best
 +#                in graphical terminals; the VT quantizes it to 16 colors)
-+# halfblock16 -> half-blocks, but pre-quantized+dithered to the VT palette
++# halfblock16 -> half-blocks pre-quantized+dithered to the VT palette, but
++#                assuming 16 bg colors (the raw VT dims bright bottom halves)
 +shader_cell_mode = shade16
 +
 +# Shader frame rate cap (1-60) and supersampling factor (1-4; the shader
@@ -51,12 +55,17 @@ diff -ruN ly-base/res/config.ini ly-work/res/config.ini
 +shader_fps = 30
 +shader_supersample = 2
 +
++# Chroma scale (0.0-2.0) applied before cell quantization. 1.0 = faithful;
++# lower it for near-monochrome shaders with weak tints, which the 16-color
++# modes would otherwise render as scattered fully-saturated color cells.
++shader_saturation = 1.0
++
  # Color mixing animation first color id
  colormix_col1 = 0x00FF0000
  
 diff -ruN ly-base/src/animations/ShaderGl.zig ly-work/src/animations/ShaderGl.zig
 --- ly-base/src/animations/ShaderGl.zig	1970-01-01 01:00:00.000000000 +0100
-+++ ly-work/src/animations/ShaderGl.zig	2026-08-30 00:37:22.631440037 +0200
++++ ly-work/src/animations/ShaderGl.zig	2026-08-30 01:09:43.956400204 +0200
 @@ -0,0 +1,684 @@
 +const std = @import("std");
 +
@@ -744,8 +753,8 @@ diff -ruN ly-base/src/animations/ShaderGl.zig ly-work/src/animations/ShaderGl.zi
 +}
 diff -ruN ly-base/src/animations/Shader.zig ly-work/src/animations/Shader.zig
 --- ly-base/src/animations/Shader.zig	1970-01-01 01:00:00.000000000 +0100
-+++ ly-work/src/animations/Shader.zig	2026-08-30 00:37:39.753584840 +0200
-@@ -0,0 +1,540 @@
++++ ly-work/src/animations/Shader.zig	2026-08-30 01:17:19.068272558 +0200
+@@ -0,0 +1,654 @@
 +const std = @import("std");
 +const Allocator = std.mem.Allocator;
 +
@@ -820,9 +829,11 @@ diff -ruN ly-base/src/animations/Shader.zig ly-work/src/animations/Shader.zig
 +
 +const shade16_dither: f32 = 20.0;
 +const halfblock16_dither: f32 = 36.0;
++const vt16_dither: f32 = 26.0;
 +
 +const lut_empty: u16 = 0xFFFF;
 +const lut_size: usize = 32768; // 5 bits per channel
++const vt_lut_size: usize = 1 << 18; // (rgb333 top, rgb333 bottom) pairs
 +
 +instance: ?Widget = null,
 +start_time: TimeOfDay,
@@ -832,6 +843,7 @@ diff -ruN ly-base/src/animations/Shader.zig ly-work/src/animations/Shader.zig
 +terminal_buffer: *TerminalBuffer,
 +mode: ShaderCellMode,
 +supersample: usize,
++saturation: f32,
 +ctx: ?ShaderGl,
 +cells: []Cell,
 +pixels: []u8,
@@ -839,6 +851,8 @@ diff -ruN ly-base/src/animations/Shader.zig ly-work/src/animations/Shader.zig
 +lut_shade: []u16,
 +// nearest VT palette index per quantized rgb555 value
 +lut_color16: []u8,
++// (glyph, fg, bg) choice per quantized (top, bottom) rgb333 pair, lazy
++lut_vt: []u16,
 +px_w: usize,
 +px_h: usize,
 +start_us: i64,
@@ -868,6 +882,7 @@ diff -ruN ly-base/src/animations/Shader.zig ly-work/src/animations/Shader.zig
 +    cell_mode: ShaderCellMode,
 +    supersample: u8,
 +    fps: u8,
++    saturation: f32,
 +    full_color: bool,
 +    animate: *bool,
 +    timeout_sec: u12,
@@ -881,11 +896,13 @@ diff -ruN ly-base/src/animations/Shader.zig ly-work/src/animations/Shader.zig
 +        .terminal_buffer = terminal_buffer,
 +        .mode = cell_mode,
 +        .supersample = math.clamp(@as(usize, supersample), 1, 4),
++        .saturation = math.clamp(saturation, 0.0, 2.0),
 +        .ctx = null,
 +        .cells = &.{},
 +        .pixels = &.{},
 +        .lut_shade = &.{},
 +        .lut_color16 = &.{},
++        .lut_vt = &.{},
 +        .px_w = 0,
 +        .px_h = 0,
 +        .start_us = nowMicros() orelse 0,
@@ -995,6 +1012,11 @@ diff -ruN ly-base/src/animations/Shader.zig ly-work/src/animations/Shader.zig
 +
 +    if (self.lut_color16.len == 0) self.lut_color16 = try self.allocator.alloc(u8, lut_size);
 +
++    if (self.lut_vt.len == 0) {
++        self.lut_vt = try self.allocator.alloc(u16, vt_lut_size);
++        @memset(self.lut_vt, lut_empty);
++    }
++
 +    if (self.ctx) |*ctx| try ctx.resize(self.px_w, self.px_h);
 +
 +    self.next_compute_us = math.minInt(i64);
@@ -1036,6 +1058,7 @@ diff -ruN ly-base/src/animations/Shader.zig ly-work/src/animations/Shader.zig
 +    if (self.pixels.len != 0) self.allocator.free(self.pixels);
 +    if (self.lut_shade.len != 0) self.allocator.free(self.lut_shade);
 +    if (self.lut_color16.len != 0) self.allocator.free(self.lut_color16);
++    if (self.lut_vt.len != 0) self.allocator.free(self.lut_vt);
 +}
 +
 +fn realloc(self: *Shader) !void {
@@ -1120,6 +1143,7 @@ diff -ruN ly-base/src/animations/Shader.zig ly-work/src/animations/Shader.zig
 +                .shade16 => self.quantizeShade16(x, y),
 +                .halfblock => self.quantizeHalfblock(x, y),
 +                .halfblock16 => self.quantizeHalfblock16(x, y),
++                .vt16 => self.quantizeVt16(x, y),
 +            };
 +        }
 +    }
@@ -1158,10 +1182,21 @@ diff -ruN ly-base/src/animations/Shader.zig ly-work/src/animations/Shader.zig
 +    }
 +
 +    const count: f32 = @floatFromInt(self.supersample * self.supersample);
-+    return .{
++    const rgb = [3]f32{
 +        @as(f32, @floatFromInt(sums[0])) / count,
 +        @as(f32, @floatFromInt(sums[1])) / count,
 +        @as(f32, @floatFromInt(sums[2])) / count,
++    };
++    if (self.saturation == 1.0) return rgb;
++
++    // shader_saturation scales chroma around luma; useful for tinted
++    // near-monochrome shaders whose weak tints would otherwise dither into
++    // scattered fully-saturated cells on a 16-color palette
++    const luma = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2];
++    return .{
++        math.clamp(luma + (rgb[0] - luma) * self.saturation, 0.0, 255.0),
++        math.clamp(luma + (rgb[1] - luma) * self.saturation, 0.0, 255.0),
++        math.clamp(luma + (rgb[2] - luma) * self.saturation, 0.0, 255.0),
 +    };
 +}
 +
@@ -1263,6 +1298,94 @@ diff -ruN ly-base/src/animations/Shader.zig ly-work/src/animations/Shader.zig
 +    return Cell.init(shade_chars[shade], paletteColor(fg), paletteColor(bg));
 +}
 +
++fn rgbToKey333(rgb: [3]f32) usize {
++    const r: usize = @intFromFloat(math.clamp(rgb[0], 0.0, 255.0));
++    const g: usize = @intFromFloat(math.clamp(rgb[1], 0.0, 255.0));
++    const b: usize = @intFromFloat(math.clamp(rgb[2], 0.0, 255.0));
++    return ((r >> 5) << 6) | ((g >> 5) << 3) | (b >> 5);
++}
++
++fn key333ToRgb(key: usize) [3]f32 {
++    const r3 = (key >> 6) & 7;
++    const g3 = (key >> 3) & 7;
++    const b3 = key & 7;
++    return .{
++        @floatFromInt((r3 << 5) | (r3 << 2) | (r3 >> 1)),
++        @floatFromInt((g3 << 5) | (g3 << 2) | (g3 >> 1)),
++        @floatFromInt((b3 << 5) | (b3 << 2) | (b3 >> 1)),
++    };
++}
++
++// True-16-color console mode. The kernel VT can only render 8 background
++// colors (there is no bright bg), so cells combine any-of-16 fg with dim-8
++// bg: upper half-blocks where the halves differ, shade blends (fg over bg)
++// where brightness has to be recovered. Emitted colors are exact VT palette
++// values, so the kernel's truecolor-to-palette mapping is an identity.
++fn quantizeVt16(self: *Shader, x: usize, y: usize) Cell {
++    const col0 = x * self.supersample;
++    const row0 = y * 2 * self.supersample;
++    const top = dither(self.averageBlock(col0, row0), x, y * 2, vt16_dither);
++    const bottom = dither(self.averageBlock(col0, row0 + self.supersample), x, y * 2 + 1, vt16_dither);
++
++    const key = (rgbToKey333(top) << 9) | rgbToKey333(bottom);
++    if (self.lut_vt[key] == lut_empty) {
++        self.lut_vt[key] = bestVt16Cell(key333ToRgb(key >> 9), key333ToRgb(key & 0x1FF));
++    }
++
++    const packed_choice = self.lut_vt[key];
++    const glyph: usize = packed_choice & 0xF;
++    const fg: usize = (packed_choice >> 4) & 0xF;
++    const bg: usize = (packed_choice >> 8) & 0x7;
++
++    return Cell.init(
++        if (glyph == 0) upper_half_block else shade_chars[glyph - 1],
++        paletteColor(fg),
++        paletteColor(bg),
++    );
++}
++
++// Like colorDistance, but punishes candidates that are more saturated than
++// the target: near-gray pixels must not dither into colored cells (the
++// dither offsets nudge grays across hue boundaries otherwise)
++fn vtDistance(candidate: [3]f32, target: [3]f32) f32 {
++    const candidate_sat = @max(candidate[0], @max(candidate[1], candidate[2])) - @min(candidate[0], @min(candidate[1], candidate[2]));
++    const target_sat = @max(target[0], @max(target[1], target[2])) - @min(target[0], @min(target[1], target[2]));
++    const excess = @max(0.0, candidate_sat - target_sat);
++    return colorDistance(candidate, target) + 2.0 * excess * excess;
++}
++
++fn bestVt16Cell(top: [3]f32, bottom: [3]f32) u16 {
++    var best_dist = math.floatMax(f32);
++    var best: u16 = 0;
++
++    for (vt_palette, 0..) |fg_rgb, fg| {
++        for (vt_palette[0..8], 0..) |bg_rgb, bg| {
++            // upper half-block: fg renders on top, bg below
++            const half_dist = vtDistance(fg_rgb, top) + vtDistance(bg_rgb, bottom);
++            if (half_dist < best_dist) {
++                best_dist = half_dist;
++                best = @intCast((bg << 8) | (fg << 4));
++            }
++
++            // shade blends render both halves as the same mixed color
++            for (shade_coverage, 1..) |coverage, glyph| {
++                const blend = [3]f32{
++                    fg_rgb[0] * coverage + bg_rgb[0] * (1.0 - coverage),
++                    fg_rgb[1] * coverage + bg_rgb[1] * (1.0 - coverage),
++                    fg_rgb[2] * coverage + bg_rgb[2] * (1.0 - coverage),
++                };
++                const dist = vtDistance(blend, top) + vtDistance(blend, bottom);
++                if (dist < best_dist) {
++                    best_dist = dist;
++                    best = @intCast((bg << 8) | (fg << 4) | glyph);
++                }
++            }
++        }
++    }
++
++    return best;
++}
++
 +fn bestShadeCell(target: [3]f32) u16 {
 +    var best_dist = math.floatMax(f32);
 +    var best: u16 = 0;
@@ -1287,8 +1410,8 @@ diff -ruN ly-base/src/animations/Shader.zig ly-work/src/animations/Shader.zig
 +    return best;
 +}
 diff -ruN ly-base/src/config/Config.zig ly-work/src/config/Config.zig
---- ly-base/src/config/Config.zig	2026-08-29 23:50:01.112586149 +0200
-+++ ly-work/src/config/Config.zig	2026-08-30 00:12:31.081002159 +0200
+--- ly-base/src/config/Config.zig	2026-08-30 01:09:43.951284715 +0200
++++ ly-work/src/config/Config.zig	2026-08-30 01:17:19.179272825 +0200
 @@ -6,6 +6,7 @@
  const ViMode = enums.ViMode;
  const Bigclock = enums.Bigclock;
@@ -1297,7 +1420,7 @@ diff -ruN ly-base/src/config/Config.zig ly-work/src/config/Config.zig
  
  allow_empty_password: bool = true,
  animation: Animation = .none,
-@@ -86,6 +87,13 @@
+@@ -86,6 +87,14 @@
  service_name: [:0]const u8 = "ly",
  session_log: ?[]const u8 = "ly-session.log",
  setup_cmd: []const u8 = build_options.config_directory ++ "/ly/setup.sh",
@@ -1306,15 +1429,16 @@ diff -ruN ly-base/src/config/Config.zig ly-work/src/config/Config.zig
 +shader_egl_lib: ?[:0]const u8 = null,
 +shader_fps: u8 = 30,
 +shader_path: ?[]const u8 = null,
++shader_saturation: f32 = 1.0,
 +shader_software: bool = false,
 +shader_supersample: u8 = 2,
  shell: bool = true,
  show_password_key: []const u8 = "F7",
  show_tty: bool = false,
 diff -ruN ly-base/src/enums.zig ly-work/src/enums.zig
---- ly-base/src/enums.zig	2026-08-29 23:50:01.112599855 +0200
-+++ ly-work/src/enums.zig	2026-08-29 23:53:49.125579938 +0200
-@@ -8,6 +8,13 @@
+--- ly-base/src/enums.zig	2026-08-30 01:09:43.951324159 +0200
++++ ly-work/src/enums.zig	2026-08-30 01:09:52.187074303 +0200
+@@ -8,6 +8,14 @@
      gameoflife,
      dur_file,
      balatro,
@@ -1325,12 +1449,13 @@ diff -ruN ly-base/src/enums.zig ly-work/src/enums.zig
 +    shade16,
 +    halfblock,
 +    halfblock16,
++    vt16,
  };
  
  pub const DisplayServer = enum {
 diff -ruN ly-base/src/main.zig ly-work/src/main.zig
---- ly-base/src/main.zig	2026-08-29 23:50:01.112615394 +0200
-+++ ly-work/src/main.zig	2026-08-30 00:12:33.202029803 +0200
+--- ly-base/src/main.zig	2026-08-30 01:09:43.951447691 +0200
++++ ly-work/src/main.zig	2026-08-30 01:17:19.279273067 +0200
 @@ -25,6 +25,7 @@
  
  const Balatro = @import("animations/Balatro.zig");
@@ -1339,7 +1464,7 @@ diff -ruN ly-base/src/main.zig ly-work/src/main.zig
  const ColorMix = @import("animations/ColorMix.zig");
  const Doom = @import("animations/Doom.zig");
  const DurFile = @import("animations/DurFile.zig");
-@@ -1091,6 +1092,42 @@
+@@ -1091,6 +1092,43 @@
              );
              animation = balatro.widget();
          },
@@ -1356,6 +1481,7 @@ diff -ruN ly-base/src/main.zig ly-work/src/main.zig
 +                state.config.shader_cell_mode,
 +                state.config.shader_supersample,
 +                state.config.shader_fps,
++                state.config.shader_saturation,
 +                state.config.full_color,
 +                &state.animate,
 +                state.config.animation_timeout_sec,
